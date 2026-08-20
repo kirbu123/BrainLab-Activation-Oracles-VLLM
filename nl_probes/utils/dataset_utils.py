@@ -50,6 +50,7 @@ class TrainingDataPoint(BaseModel):
     target_output: str
     context_input_ids: list[int] | None
     context_positions: list[int] | None
+    context_image_paths: list[str] | None = None
     ds_label: str | None  # label from the dataset
     meta_info: Mapping[str, Any] = {}
 
@@ -160,6 +161,7 @@ def materialize_missing_steering_vectors(
     batch_points: list[TrainingDataPoint],
     tokenizer: AutoTokenizer,
     model: PeftModel,
+    processor=None,
 ) -> list[TrainingDataPoint]:
     """
     Materialization of missing steering vectors for a heterogenous batch
@@ -167,10 +169,9 @@ def materialize_missing_steering_vectors(
 
     Steps:
       1) Find items with steering_vectors=None.
-      2) Build a left-padded batch from their context_input_ids.
-      3) Register hooks for all unique requested layers and run exactly one forward pass.
-      4) For each item, take activations at its requested layer and its context_positions,
-         then write back a [num_positions, D] tensor to dp.steering_vectors. Returns a new batch.
+      2) Text items: left-padded batch from context_input_ids (existing path).
+      3) Image items: per-example multimodal forward using stored target messages.
+      4) Write back a [num_positions, D] tensor to dp.steering_vectors.
 
     No-op if every item already has steering_vectors.
     """
@@ -185,12 +186,30 @@ def materialize_missing_steering_vectors(
 
     # Validate context fields
     for _, dp in to_fill:
-        if dp.context_input_ids is None or dp.context_positions is None:
+        if dp.context_positions is None or dp.context_input_ids is None:
             raise ValueError(
                 "Datapoint has steering_vectors=None but is missing context_input_ids or context_positions"
             )
 
-    # Build the input batch (left padding to match your construct_batch convention)
+    text_items = [(i, dp) for i, dp in to_fill if not dp.context_image_paths]
+    image_items = [(i, dp) for i, dp in to_fill if dp.context_image_paths]
+
+    new_batch: list[TrainingDataPoint] = list(batch_points)
+
+    if text_items:
+        new_batch = _materialize_text_items(new_batch, text_items, tokenizer, model)
+    if image_items:
+        new_batch = _materialize_image_items(new_batch, image_items, model, processor)
+
+    return new_batch
+
+
+def _materialize_text_items(
+    batch_points: list[TrainingDataPoint],
+    to_fill: list[tuple[int, TrainingDataPoint]],
+    tokenizer: AutoTokenizer,
+    model: PeftModel,
+) -> list[TrainingDataPoint]:
     pad_id = tokenizer.pad_token_id
     contexts: list[list[int]] = [list(dp.context_input_ids) for _, dp in to_fill]
     positions_per_item: list[list[int]] = [list(dp.context_positions) for _, dp in to_fill]
@@ -205,7 +224,6 @@ def materialize_missing_steering_vectors(
     for c in contexts:
         pad_len = max_len - len(c)
         input_ids_tensors.append(torch.tensor([pad_id] * pad_len + c, dtype=torch.long, device=device))
-        # For HF, bool masks are fine; your construct_batch uses bool too
         attn_masks_tensors.append(torch.tensor([False] * pad_len + [True] * len(c), dtype=torch.bool, device=device))
         left_offsets.append(pad_len)
 
@@ -214,15 +232,12 @@ def materialize_missing_steering_vectors(
         "attention_mask": torch.stack(attn_masks_tensors, dim=0),
     }
 
-    # Prepare hooks for all unique requested layers
     layers_needed = sorted({dp.layer for _, dp in to_fill})
     submodules = {layer: get_hf_submodule(model, layer, use_lora=True) for layer in layers_needed}
 
-    # Run a single pass with dropout off, then restore the previous train/eval mode
     was_training = model.training
     model.eval()
     with model.disable_adapter():
-        # [layer] -> [B, L, D], where B == len(to_fill)
         acts_by_layer = collect_activations_multiple_layers(
             model=model,
             submodules=submodules,
@@ -233,27 +248,98 @@ def materialize_missing_steering_vectors(
     if was_training:
         model.train()
 
-    # Build the new list, copying only items we change
-    new_batch: list[TrainingDataPoint] = list(batch_points)  # references by default
+    new_batch: list[TrainingDataPoint] = list(batch_points)
     for b in range(len(to_fill)):
         idx, dp = to_fill[b]
         layer = dp.layer
-        acts_BLD = acts_by_layer[layer]  # [B, L, D] on GPU
+        acts_BLD = acts_by_layer[layer]
 
         idxs = [p + left_offsets[b] for p in positions_per_item[b]]
-        # Bounds check for safety
         L = acts_BLD.shape[1]
         if any(i < 0 or i >= L for i in idxs):
             raise IndexError(f"Activation index out of range for item {b}: {idxs} with L={L}")
 
         vectors = acts_BLD[b, idxs, :].detach().contiguous()
-
         assert len(vectors.shape) == 2, f"Expected 2D tensor, got vectors.shape={vectors.shape}"
 
         dp_new = dp.model_copy(deep=True)
         dp_new.steering_vectors = vectors
-
         new_batch[idx] = dp_new
+
+    return new_batch
+
+
+def _materialize_image_items(
+    batch_points: list[TrainingDataPoint],
+    to_fill: list[tuple[int, TrainingDataPoint]],
+    model: PeftModel,
+    processor,
+) -> list[TrainingDataPoint]:
+    from nl_probes.utils.common import load_processor
+    from nl_probes.utils.vlm_utils import vision_inputs_to_device, vlm_tokenize_target
+
+    if processor is None:
+        model_name = model.config._name_or_path
+        processor = load_processor(model_name)
+
+    device = next(model.parameters()).device
+    new_batch: list[TrainingDataPoint] = list(batch_points)
+
+    was_training = model.training
+    model.eval()
+    try:
+        for idx, dp in to_fill:
+            messages = None
+            if dp.meta_info:
+                messages = dp.meta_info.get("target_messages")
+            add_generation_prompt = True
+            if dp.meta_info:
+                add_generation_prompt = bool(dp.meta_info.get("add_generation_prompt", True))
+
+            if messages is not None:
+                _, proc_inputs = vlm_tokenize_target(
+                    processor,
+                    messages,
+                    add_generation_prompt=add_generation_prompt,
+                )
+                inputs_BL = vision_inputs_to_device(proc_inputs, device)
+            else:
+                from PIL import Image
+
+                images = [Image.open(p).convert("RGB") for p in dp.context_image_paths]
+                image_processor = getattr(processor, "image_processor", processor)
+                vision = image_processor(images=images, return_tensors="pt")
+                input_ids = torch.tensor([dp.context_input_ids], dtype=torch.long, device=device)
+                inputs_BL = {
+                    "input_ids": input_ids,
+                    "attention_mask": torch.ones_like(input_ids, dtype=torch.bool),
+                }
+                inputs_BL.update(vision_inputs_to_device(dict(vision), device))
+
+            submodules = {dp.layer: get_hf_submodule(model, dp.layer, use_lora=True)}
+            with model.disable_adapter():
+                acts_by_layer = collect_activations_multiple_layers(
+                    model=model,
+                    submodules=submodules,
+                    inputs_BL=inputs_BL,
+                    min_offset=None,
+                    max_offset=None,
+                )
+            acts_BLD = acts_by_layer[dp.layer]
+            L = acts_BLD.shape[1]
+            idxs = list(dp.context_positions)
+            if any(i < 0 or i >= L for i in idxs):
+                raise IndexError(
+                    f"Activation index out of range for image item {idx}: {idxs} with L={L} "
+                    f"(stored context_input_ids len={len(dp.context_input_ids)})"
+                )
+            vectors = acts_BLD[0, idxs, :].detach().contiguous()
+            dp_new = dp.model_copy(deep=True)
+            dp_new.steering_vectors = vectors
+            new_batch[idx] = dp_new
+    finally:
+        if was_training:
+            model.train()
 
     return new_batch
 
@@ -285,6 +371,13 @@ def find_pattern_in_tokens(
     return positions
 
 
+def apply_tokenizer_chat_template(tokenizer: AutoTokenizer, messages, **kwargs):
+    try:
+        return tokenizer.apply_chat_template(messages, enable_thinking=False, **kwargs)
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, **kwargs)
+
+
 def create_training_datapoint(
     datapoint_type: str,
     prompt: str,
@@ -296,6 +389,7 @@ def create_training_datapoint(
     feature_idx: int,
     context_input_ids: list[int] | None = None,
     context_positions: list[int] | None = None,
+    context_image_paths: list[str] | None = None,
     ds_label: str | None = None,
     meta_info: Mapping[str, Any] | None = None,
 ) -> TrainingDataPoint:
@@ -306,26 +400,26 @@ def create_training_datapoint(
     prompt = prefix + prompt
     input_messages = [{"role": "user", "content": prompt}]
 
-    input_prompt_ids = tokenizer.apply_chat_template(
+    input_prompt_ids = apply_tokenizer_chat_template(
+        tokenizer,
         input_messages,
         tokenize=True,
         add_generation_prompt=True,
         return_tensors=None,
         padding=False,
-        enable_thinking=False,
     )
     if not isinstance(input_prompt_ids, list):
         raise TypeError("Expected list of token ids from tokenizer")
 
     full_messages = input_messages + [{"role": "assistant", "content": target_response}]
 
-    full_prompt_ids = tokenizer.apply_chat_template(
+    full_prompt_ids = apply_tokenizer_chat_template(
+        tokenizer,
         full_messages,
         tokenize=True,
         add_generation_prompt=False,
         return_tensors=None,
         padding=False,
-        enable_thinking=False,
     )
     if not isinstance(full_prompt_ids, list):
         raise TypeError("Expected list of token ids from tokenizer")
@@ -358,6 +452,7 @@ def create_training_datapoint(
         datapoint_type=datapoint_type,
         context_input_ids=context_input_ids,
         context_positions=context_positions,
+        context_image_paths=context_image_paths,
         ds_label=ds_label,
         meta_info=meta_info,
     )

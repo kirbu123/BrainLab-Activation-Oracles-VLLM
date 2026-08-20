@@ -35,16 +35,10 @@ from nl_probes.dataset_classes.classification import (
 )
 from nl_probes.dataset_classes.latentqa_dataset import LatentQADatasetConfig, LatentQADatasetLoader
 from nl_probes.dataset_classes.past_lens_dataset import PastLensDatasetConfig, PastLensDatasetLoader
-from nl_probes.dataset_classes.sae_training_data import (
-    SAEActivatingSequencesDatasetConfig,
-    SAEActivatingSequencesDatasetLoader,
-    SAEExplanationDatasetConfig,
-    SAEExplanationDatasetLoader,
-    SAEYesNoDatasetConfig,
-    SAEYesNoDatasetLoader,
-)
-from nl_probes.utils.activation_utils import get_hf_submodule, get_text_only_lora_targets
-from nl_probes.utils.common import load_model, load_tokenizer, set_seed
+from nl_probes.dataset_classes.snli_ve import SNLIVEDatasetConfig, SNLIVEDatasetLoader
+from nl_probes.dataset_classes.visual_spqa_dataset import VisualSPQADatasetConfig, VisualSPQADatasetLoader
+from nl_probes.utils.activation_utils import get_hf_submodule, get_text_only_lora_targets, freeze_vision_parameters
+from nl_probes.utils.common import load_model, load_tokenizer, load_processor, set_seed, is_vlm_model
 from nl_probes.utils.dataset_utils import (
     BatchData,
     EvalStepResult,
@@ -241,6 +235,7 @@ def eval_all_datasets(
     device: torch.device,
     dtype: torch.dtype,
     global_step: int,
+    processor=None,
 ) -> None:
     model.eval()
     eval_results = {}
@@ -257,6 +252,7 @@ def eval_all_datasets(
             eval_batch_size=cfg.eval_batch_size,
             steering_coefficient=cfg.steering_coefficient,
             generation_kwargs=cfg.generation_kwargs,
+            processor=processor,
         )
         percent_format_correct, percent_ans_correct = score_eval_responses(eval_responses, eval_datasets[ds])
         eval_results[f"eval_format_correct/{ds}"] = percent_format_correct
@@ -327,6 +323,10 @@ def train_model(
 
     set_seed(cfg.seed)
     model = load_model(cfg.model_name, dtype, **model_kwargs)
+    processor = load_processor(cfg.model_name) if is_vlm_model(cfg.model_name) else None
+
+    if is_vlm_model(cfg.model_name):
+        freeze_vision_parameters(model)
 
     model.enable_input_require_grads()
 
@@ -433,7 +433,9 @@ def train_model(
             t_batch_list: list[TrainingDataPoint] = training_data[start : start + cfg.train_batch_size]
 
             # Compute missing steering vectors using the PEFT model (not DDP wrapper)
-            t_batch_list = materialize_missing_steering_vectors(t_batch_list, tokenizer, model)
+            t_batch_list = materialize_missing_steering_vectors(
+                t_batch_list, tokenizer, model, processor=processor
+            )
 
             t_batch = construct_batch(t_batch_list, tokenizer, device)
 
@@ -465,7 +467,17 @@ def train_model(
                 # -------------------------------- evaluation --------------------------------
                 if global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
                     if rank == 0:
-                        eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
+                        eval_all_datasets(
+                            cfg,
+                            eval_datasets,
+                            model,
+                            tokenizer,
+                            submodule,
+                            device,
+                            dtype,
+                            global_step,
+                            processor=processor,
+                        )
                     dist.barrier()
 
                 if global_step % cfg.save_steps == 0 and global_step > 0:
@@ -495,7 +507,9 @@ def train_model(
 
         # Final evaluation
         print("Running final evaluation...")
-        eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
+        eval_all_datasets(
+            cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step, processor=processor
+        )
         wandb.finish()
 
         # Push to Hugging Face if configured
@@ -606,6 +620,14 @@ def build_loader_groups(
     classification_datasets: dict[str, dict[str, Any]],
     model_kwargs: dict[str, Any],
 ) -> dict[str, list[ActDatasetLoader]]:
+    from nl_probes.dataset_classes.sae_training_data import (
+        SAEActivatingSequencesDatasetConfig,
+        SAEActivatingSequencesDatasetLoader,
+        SAEExplanationDatasetConfig,
+        SAEExplanationDatasetLoader,
+        SAEYesNoDatasetConfig,
+        SAEYesNoDatasetLoader,
+    )
     DEBUG = False
     num_datapoints = 100_000
 
@@ -873,19 +895,11 @@ if __name__ == "__main__":
     device = torch.device(f"cuda:{local_rank}")
 
     hook_layer = 1
-    # model_name = "Qwen/Qwen3-32B"
-    # model_name = "meta-llama/Llama-3.3-70B-Instruct"
-    # model_name = "google/gemma-2-9b-it"
-    # model_name = "Qwen/Qwen3-8B"
+    # Text-only AO (original paper mixture). Kept for reference.
+    # models = ["Qwen/Qwen3-4B"]
 
     models = [
-        # "Qwen/Qwen3-14B",
-        # "google/gemma-2-27b-it",
-        # "meta-llama/Llama-3.1-8B-Instruct",
-        # "google/gemma-3-4b-it",
-        # "google/gemma-3-12b-it",
-        # "google/gemma-3-27b-it",
-        "Qwen/Qwen3-4B",
+        "Qwen/Qwen3-VL-4B-Instruct",
     ]
 
     for model_name in models:
@@ -904,10 +918,6 @@ if __name__ == "__main__":
             )
             model_kwargs = {"quantization_config": bnb_config}
 
-        # if model_name == "meta-llama/Llama-3.3-70B-Instruct":
-        # train_batch_size = train_batch_size * 4  # increase gpu utilization on 4x GPUs
-        # cuts training time by ~50%
-
         print("Global train batch size:", train_batch_size)
         assert train_batch_size % world_size == 0, (
             f"Global batch size {train_batch_size} must be divisible by world_size {world_size}"
@@ -917,50 +927,74 @@ if __name__ == "__main__":
 
         layer_percents = [25, 50, 75]
         save_acts = False
-
         gradient_accumulation_steps = 1
 
-        # Build loader groups (single + multi variants)
-        loader_groups = build_loader_groups(
-            model_name=model_name,
-            layer_percents=layer_percents,
-            act_collection_batch_size=train_batch_size,
-            save_acts=save_acts,
-            classification_datasets=classification_datasets,
-            model_kwargs=model_kwargs,
-        )
-
-        classification_dataset_loaders = loader_groups["classification_loaders"]
-        past_lens_loaders = loader_groups["past_lens_loaders"]
-        sae_dataset_loaders = loader_groups["sae_loaders"]
-        sae_explanation_dataset_loaders = loader_groups["sae_explanation_loaders"]
-        latentqa_loaders = loader_groups["latentqa_loaders"]
-
-        iterations = [
-            # Default dataset mixture
-            # Set load_lora_path to checkpoint path to continue training
-            {
-                "load_lora_path": None,
-                "dataset_loaders": latentqa_loaders + classification_dataset_loaders + past_lens_loaders,
-                "wandb_suffix": f"_latentqa_cls_past_lens_{model_name_str}",
-            },
-            # {
-            #     "load_lora_path": None,
-            #     "dataset_loaders": latentqa_loaders,
-            #     "wandb_suffix": f"_latentqa_only_{model_name_str}",
-            # },
-        ]
+        if is_vlm_model(model_name):
+            visual_spqa_loader = VisualSPQADatasetLoader(
+                dataset_config=mk_cfg(
+                    VisualSPQADatasetConfig(),
+                    num_train=150_000,
+                    num_test=0,
+                    splits=["train"],
+                    model_name=model_name,
+                    layer_percents=layer_percents,
+                    save_acts=False,
+                    batch_size=train_batch_size,
+                )
+            )
+            snli_ve_loader = SNLIVEDatasetLoader(
+                dataset_config=mk_cfg(
+                    SNLIVEDatasetConfig(),
+                    num_train=0,
+                    num_test=250,
+                    splits=["test"],
+                    model_name=model_name,
+                    layer_percents=layer_percents,
+                    save_acts=True,
+                    batch_size=max(1, min(4, train_batch_size)),
+                ),
+                model_kwargs=model_kwargs,
+            )
+            iterations = [
+                {
+                    "load_lora_path": None,
+                    "dataset_loaders": [visual_spqa_loader, snli_ve_loader],
+                    "wandb_suffix": f"_visual_spqa_snlive_{model_name_str}",
+                    "eval_steps": 2000,
+                    "eval_on_start": True,
+                    "activation_collection_batch_size": max(1, train_batch_size),
+                    "eval_batch_size": max(8, train_batch_size * 4),
+                },
+            ]
+        else:
+            loader_groups = build_loader_groups(
+                model_name=model_name,
+                layer_percents=layer_percents,
+                act_collection_batch_size=train_batch_size,
+                save_acts=save_acts,
+                classification_datasets=classification_datasets,
+                model_kwargs=model_kwargs,
+            )
+            classification_dataset_loaders = loader_groups["classification_loaders"]
+            past_lens_loaders = loader_groups["past_lens_loaders"]
+            latentqa_loaders = loader_groups["latentqa_loaders"]
+            iterations = [
+                {
+                    "load_lora_path": None,
+                    "dataset_loaders": latentqa_loaders + classification_dataset_loaders + past_lens_loaders,
+                    "wandb_suffix": f"_latentqa_cls_past_lens_{model_name_str}",
+                },
+            ]
 
         for hyperparam_override in iterations:
             loop_dataset_loaders = hyperparam_override.pop("dataset_loaders")
-            if hyperparam_override["load_lora_path"] is not None:
+            if hyperparam_override.get("load_lora_path") is not None:
                 assert os.path.exists(hyperparam_override["load_lora_path"]), f"{hyperparam_override['load_lora_path']}"
 
-            cfg = SelfInterpTrainingConfig(
+            cfg_kwargs = dict(
                 model_name=model_name,
                 hook_onto_layer=hook_layer,
                 hf_repo_name=hf_repo_name,
-                # wandb_suffix=wandb_suffix,
                 layer_percents=layer_percents,
                 train_batch_size=train_batch_size,
                 activation_collection_batch_size=train_batch_size * 4,
@@ -969,8 +1003,9 @@ if __name__ == "__main__":
                 eval_on_start=True,
                 gradient_checkpointing=gradient_checkpointing,
                 gradient_accumulation_steps=gradient_accumulation_steps,
-                **hyperparam_override,
             )
+            cfg_kwargs.update(hyperparam_override)
+            cfg = SelfInterpTrainingConfig(**cfg_kwargs)
 
             cfg.finalize(dataset_loaders=loop_dataset_loaders)
 

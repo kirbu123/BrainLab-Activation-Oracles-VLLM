@@ -1,9 +1,19 @@
 import random
+from typing import Any
 
 import numpy as np
 import torch
 from peft import PeftModel
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer, BitsAndBytesConfig
+
+
+def is_qwen3_vl(model_name: str) -> bool:
+    return "qwen3-vl" in model_name.lower()
+
+
+def is_vlm_model(model_name: str) -> bool:
+    name = model_name.lower()
+    return "qwen3-vl" in name or "gemma-3" in name
 
 
 def set_seed(seed: int) -> None:
@@ -22,26 +32,58 @@ def load_model(
 ) -> AutoModelForCausalLM:
     print("🧠 Loading model...")
 
-    # Gemma prefers eager attention; others use FA2
-    attn = "eager" if "gemma" in model_name.lower() else "flash_attention_2"
+    requested_attn = model_kwargs.pop("attn_implementation", None)
+    if requested_attn is None:
+        requested_attn = "eager" if "gemma" in model_name.lower() else "flash_attention_2"
 
     kwargs: dict = {
         "device_map": "auto",
-        "attn_implementation": attn,
         "torch_dtype": dtype,
         **model_kwargs,
     }
+    # transformers>=4.57 prefers `dtype`; keep torch_dtype for older callers.
+    kwargs.setdefault("dtype", dtype)
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
-    return model
+    def _from_pretrained(attn: str):
+        local_kwargs = {**kwargs, "attn_implementation": attn}
+        if is_qwen3_vl(model_name):
+            from transformers import Qwen3VLForConditionalGeneration
+
+            return Qwen3VLForConditionalGeneration.from_pretrained(model_name, **local_kwargs)
+        return AutoModelForCausalLM.from_pretrained(model_name, **local_kwargs)
+
+    try:
+        return _from_pretrained(requested_attn)
+    except (ImportError, ValueError) as exc:
+        if requested_attn != "sdpa":
+            print(f"Falling back to sdpa attention ({exc})")
+            return _from_pretrained("sdpa")
+        raise
+
+
+def load_processor(model_name: str) -> Any:
+    print("📦 Loading processor...")
+    processor = AutoProcessor.from_pretrained(model_name)
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not None:
+        tokenizer.padding_side = "left"
+        if not tokenizer.pad_token_id:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        if not tokenizer.bos_token_id:
+            tokenizer.bos_token_id = tokenizer.eos_token_id
+    return processor
 
 
 def load_tokenizer(
     model_name: str,
 ) -> AutoTokenizer:
-    # Load tokenizer
+    # Load tokenizer. For VLMs, share the processor tokenizer so chat templates stay aligned.
     print("📦 Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if is_vlm_model(model_name):
+        processor = load_processor(model_name)
+        tokenizer = getattr(processor, "tokenizer", None) or AutoTokenizer.from_pretrained(model_name)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.padding_side = "left"
 
     if not tokenizer.pad_token_id:
@@ -121,11 +163,14 @@ def assert_no_peft_present(model, check_for_active_adapter_only=False):
 def get_layer_count(model_name: str) -> int:
     """Get the number of layers from a HuggingFace model config."""
     config = AutoConfig.from_pretrained(model_name)
-    if hasattr(config, "num_hidden_layers"):
-        return config.num_hidden_layers
-    elif hasattr(config, "text_config"):
-        # Gemma-3 models store config in text_config
-        return config.text_config.num_hidden_layers
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        n = getattr(text_config, "num_hidden_layers", None)
+        if n:
+            return int(n)
+    n = getattr(config, "num_hidden_layers", None)
+    if n:
+        return int(n)
     raise AttributeError(f"Could not find layer count for {model_name}")
 
 

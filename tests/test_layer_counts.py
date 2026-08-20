@@ -19,6 +19,7 @@ KNOWN_LAYER_COUNTS = {
     "meta-llama/Llama-3.1-8B-Instruct": 32,
     "meta-llama/Llama-3.2-1B-Instruct": 16,
     "meta-llama/Llama-3.3-70B-Instruct": 80,
+    "Qwen/Qwen3-VL-4B-Instruct": 36,
 }
 
 

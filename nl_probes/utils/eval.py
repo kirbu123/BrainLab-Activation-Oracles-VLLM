@@ -110,6 +110,7 @@ def run_evaluation(
     steering_coefficient: float,
     generation_kwargs: dict,
     verbose: bool = False,
+    processor=None,
 ) -> list[FeatureResult]:
     """Run evaluation and save results."""
     if lora_path is not None:
@@ -128,7 +129,7 @@ def run_evaluation(
             for j in range(len(e_batch)):
                 e_batch[j] = get_prompt_tokens_only(e_batch[j])
 
-            e_batch = materialize_missing_steering_vectors(e_batch, tokenizer, model)
+            e_batch = materialize_missing_steering_vectors(e_batch, tokenizer, model, processor=processor)
 
             e_batch = construct_batch(e_batch, tokenizer, device)
 

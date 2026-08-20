@@ -123,20 +123,69 @@ def collect_activations_multiple_layers(
 # These patterns target only the language model layers.
 VLM_TEXT_ONLY_LORA_TARGETS = {
     "gemma-3": r"model\.language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)",
+    "qwen3-vl": r"model\.language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)",
 }
 
 
 def get_text_only_lora_targets(model_name: str) -> str | None:
     """Returns LoRA target pattern for text-only training on VLMs, or None if not a VLM."""
-    for pattern, targets in VLM_TEXT_ONLY_LORA_TARGETS.items():
-        if pattern in model_name.lower():
+    name = model_name.lower()
+    # Longer / more specific keys first so "qwen3-vl" wins over a future generic "qwen" entry.
+    for pattern, targets in sorted(VLM_TEXT_ONLY_LORA_TARGETS.items(), key=lambda kv: -len(kv[0])):
+        if pattern in name:
             return targets
     return None
+
+
+def freeze_vision_parameters(model: torch.nn.Module) -> int:
+    """Freeze vision-tower params so oracle text-only steps do not DDP-error."""
+    frozen = 0
+    candidates = []
+    for attr in ("visual", "vision_model", "vision_tower"):
+        if hasattr(model, attr):
+            candidates.append(getattr(model, attr))
+    inner = getattr(model, "model", None)
+    if inner is not None:
+        for attr in ("visual", "vision_model", "vision_tower"):
+            if hasattr(inner, attr):
+                candidates.append(getattr(inner, attr))
+    for module in candidates:
+        if module is None:
+            continue
+        for param in module.parameters():
+            if param.requires_grad:
+                param.requires_grad = False
+                frozen += 1
+    print(f"Froze {frozen} vision-tower parameters")
+    return frozen
+
+
+def _unwrap_peft_model(model: torch.nn.Module) -> torch.nn.Module:
+    inner = model
+    if hasattr(inner, "base_model") and hasattr(inner, "peft_config"):
+        inner = inner.base_model
+        if hasattr(inner, "model"):
+            inner = inner.model
+    return inner
+
+
+def _get_language_layers(model: torch.nn.Module):
+    root = _unwrap_peft_model(model)
+    if hasattr(root, "model") and hasattr(root.model, "language_model"):
+        return root.model.language_model.layers
+    if hasattr(root, "language_model"):
+        return root.language_model.layers
+    if hasattr(root, "model") and hasattr(root.model, "layers"):
+        return root.model.layers
+    raise ValueError(f"Could not find language layers on {type(root)}")
 
 
 def get_hf_submodule(model: AutoModelForCausalLM, layer: int, use_lora: bool = False):
     """Gets the residual stream submodule for HF transformers"""
     model_name = model.config._name_or_path
+
+    if "qwen3-vl" in model_name.lower():
+        return _get_language_layers(model)[layer]
 
     if use_lora:
         if "pythia" in model_name:
