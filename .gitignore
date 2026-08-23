@@ -191,3 +191,12 @@ openai_api_key.txt
 *checkpoints*
 *max_acts*
 *model_lora*
+
+# Keep the small, redistributable inputs and data layout documentation.
+!data/
+data/*
+!data/README.md
+!data/train/
+data/train/*
+!data/train/latentqa/
+!data/train/latentqa/*.json

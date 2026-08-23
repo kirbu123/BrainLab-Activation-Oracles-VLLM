@@ -22,7 +22,7 @@ class SelfInterpTrainingConfig:
     use_decoder_vectors: bool = True
     generation_kwargs: dict[str, Any] = field(default_factory=lambda: {"do_sample": False, "max_new_tokens": 20})
     steering_coefficient: float = 1.0
-    dataset_folder: str = "sft_training_data"
+    dataset_folder: str = "data/cache"
 
     # --- Batching ---
     train_batch_size: int = 16
@@ -46,16 +46,20 @@ class SelfInterpTrainingConfig:
     gradient_checkpointing: bool = False
     window_mult: int = 20
     save_steps: int = 5_000
-    save_dir: str = "checkpoints"
     seed: int = 42
-    eval_logs_path: str = "eval_logs.json"
-    results_html_path: str = "logs/train_results.html"
     load_lora_path: str | None = None
 
     # --- Tracking ---
     wandb_project: str = "sae_introspection"
     wandb_run_name: str = ""  # derived if empty
     wandb_suffix: str = ""
+    run_id: str = ""
+    logs_root: str = "logs"
+    run_dir: str = ""
+    save_dir: str = ""
+    results_html_path: str = ""
+    result_log_path: str = ""
+    tensorboard_dir: str = ""
 
     # --- Hub ---
     hf_push_to_hub: bool = False
@@ -78,14 +82,20 @@ class SelfInterpTrainingConfig:
         if not self.wandb_run_name:
             self.wandb_run_name = default_run
 
-        # save dir namespacing
-        if self.wandb_suffix and not self.save_dir.endswith(self.wandb_suffix):
-            self.save_dir = f"{self.save_dir}{self.wandb_suffix}"
-
-        if self.wandb_suffix:
-            html_path = Path(self.results_html_path)
-            if not html_path.stem.endswith(self.wandb_suffix):
-                self.results_html_path = str(html_path.with_name(f"{html_path.stem}{self.wandb_suffix}{html_path.suffix}"))
+        if not self.run_id:
+            self.run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        experiment_name = self.wandb_suffix.strip("_") or self.model_name.split("/")[-1]
+        experiment_name = experiment_name.replace("/", "_").replace(" ", "_")
+        if not self.run_dir:
+            self.run_dir = str(Path(self.logs_root) / f"{self.run_id}_{experiment_name}")
+        if not self.save_dir:
+            self.save_dir = str(Path(self.run_dir) / "checkpoints")
+        if not self.results_html_path:
+            self.results_html_path = str(Path(self.run_dir) / "results.html")
+        if not self.result_log_path:
+            self.result_log_path = str(Path(self.run_dir) / "training.log")
+        if not self.tensorboard_dir:
+            self.tensorboard_dir = str(Path(self.run_dir) / "tensorboard")
 
         # repo id if pushing
         if self.hf_push_to_hub and not self.hf_repo_id:

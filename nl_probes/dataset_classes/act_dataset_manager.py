@@ -25,7 +25,7 @@ class DatasetLoaderConfig:
     save_acts: bool
     batch_size: int
     dataset_name: str = ""
-    dataset_folder: str = "sft_training_data"
+    dataset_folder: str = "data/cache"
     seed: int = 42
 
 

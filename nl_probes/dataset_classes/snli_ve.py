@@ -37,8 +37,8 @@ SNLI_VE_PARAPHRASES = [
 
 @dataclass
 class SNLIVEDatasetConfig(BaseDatasetConfig):
-    annotations_path: str = "data/snli_ve/snli_ve_dev.jsonl"
-    flickr_image_dir: str = "data/flickr30k/flickr30k-images"
+    annotations_path: str = "data/val/snli_ve/snli_ve_dev.jsonl"
+    flickr_image_dir: str = "data/val/flickr30k/flickr30k-images"
     num_qa_per_sample: int = 2
     min_end_offset: int = -1
     max_end_offset: int = -5

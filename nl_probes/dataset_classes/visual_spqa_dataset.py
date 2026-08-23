@@ -25,8 +25,9 @@ IMAGE_TOKEN_RE = re.compile(r"\s*<image>\s*", re.IGNORECASE)
 
 @dataclass
 class VisualSPQADatasetConfig(BaseDatasetConfig):
-    llava_json_path: str = "data/llava/llava_instruct_150k.json"
-    coco_image_dir: str = "data/coco/train2017"
+    llava_json_path: str = "data/train/llava/llava_instruct_150k.json"
+    coco_image_dir: str = "data/train/coco/train2017"
+    latentqa_dir: str = "data/train/latentqa"
     max_window_size: int = 3
     min_window_size: int = 1
     min_end_offset: int = -1
@@ -63,7 +64,10 @@ class VisualSPQADatasetLoader(ActDatasetLoader):
             self.dataset_params.llava_json_path,
             self.dataset_params.coco_image_dir,
         )
-        latentqa_items = load_latentqa_overlays(seed=self.dataset_config.seed)
+        latentqa_items = load_latentqa_overlays(
+            latentqa_dir=self.dataset_params.latentqa_dir,
+            seed=self.dataset_config.seed,
+        )
         if not llava_examples:
             raise FileNotFoundError(
                 f"No LLaVA examples with images under {self.dataset_params.coco_image_dir}. "
@@ -167,13 +171,14 @@ def strip_image_token(text: str) -> str:
     return IMAGE_TOKEN_RE.sub(" ", text).strip()
 
 
-def load_latentqa_overlays(seed: int = 42) -> list[dict]:
+def load_latentqa_overlays(latentqa_dir: str, seed: int = 42) -> list[dict]:
+    root = Path(latentqa_dir)
     paths = latentqa_loader.DataPaths(
         system=None,
-        stimulus_completion="datasets/latentqa_datasets/train/stimulus_completion.json",
-        stimulus="datasets/latentqa_datasets/train/stimulus.json",
-        control="datasets/latentqa_datasets/train/control.json",
-        qa="datasets/latentqa_datasets/train/qa.json",
+        stimulus_completion=str(root / "stimulus_completion.json"),
+        stimulus=str(root / "stimulus.json"),
+        control=str(root / "control.json"),
+        qa=str(root / "qa.json"),
     )
     ds = latentqa_loader.load_latentqa_dataset(
         paths,

@@ -4,9 +4,10 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import gc
 import json
+import logging
 import math
 import random
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 # All necessary imports are now included above
 from dataclasses import asdict, dataclass, field
@@ -16,6 +17,7 @@ from typing import Any, Optional
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch.nn.utils import clip_grad_norm_
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer, BitsAndBytesConfig
 from transformers.optimization import get_linear_schedule_with_warmup
@@ -49,6 +51,17 @@ from nl_probes.utils.dataset_utils import (
 )
 from nl_probes.utils.eval import run_evaluation, score_eval_responses
 from nl_probes.utils.results_html import ResultsHtmlLogger
+
+
+def create_run_logger(log_path: str) -> logging.Logger:
+    logger = logging.getLogger(f"activation_oracle.{Path(log_path).parent.name}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+    return logger
 
 
 def push_lora_to_hf(
@@ -415,6 +428,13 @@ def train_model(
 
     global_step = 0
     results_log = ResultsHtmlLogger() if rank == 0 else None
+    run_logger = create_run_logger(cfg.result_log_path) if rank == 0 else None
+    tensorboard = SummaryWriter(log_dir=cfg.tensorboard_dir) if rank == 0 else None
+    if run_logger is not None:
+        run_logger.info("Starting run %s", cfg.wandb_run_name)
+        run_logger.info("Configuration: %s", json.dumps(asdict(cfg), sort_keys=True))
+    if tensorboard is not None:
+        tensorboard.add_text("run/config", json.dumps(asdict(cfg), indent=2, sort_keys=True))
 
     def _record_eval_and_write_html(step: int) -> None:
         if results_log is None:
@@ -436,11 +456,17 @@ def train_model(
             n_by_dataset={name: len(items) for name, items in eval_datasets.items()},
         )
         html_path = results_log.write(cfg)
+        assert run_logger is not None
+        assert tensorboard is not None
+        run_logger.info("Evaluation step=%d metrics=%s", step, json.dumps(metrics, sort_keys=True))
+        for metric_name, value in metrics.items():
+            tensorboard.add_scalar(metric_name, value, step)
+        tensorboard.flush()
         print(f"Wrote results HTML: {html_path.resolve()}")
 
     # Init Weights & Biases only on rank 0
     if rank == 0:
-        wandb.init(project=cfg.wandb_project, name=cfg.wandb_run_name, config=asdict(cfg))
+        wandb.init(project=cfg.wandb_project, name=cfg.wandb_run_name, config=asdict(cfg), dir=cfg.run_dir)
         wandb.summary["train/tokens_per_epoch_est"] = tokens_per_epoch_est
         wandb.summary["train/total_tokens_est"] = total_training_tokens_est
         wandb.summary["train/num_examples_pre_shard"] = num_examples_pre_shard
@@ -489,6 +515,17 @@ def train_model(
                     )
                     if results_log is not None:
                         results_log.append_loss(global_step, accumulated_loss, lr_now)
+                    assert run_logger is not None
+                    assert tensorboard is not None
+                    run_logger.info(
+                        "Training step=%d epoch=%d loss=%.8f learning_rate=%.10g",
+                        global_step,
+                        epoch + 1,
+                        accumulated_loss,
+                        lr_now,
+                    )
+                    tensorboard.add_scalar("train/loss", accumulated_loss, global_step)
+                    tensorboard.add_scalar("train/learning_rate", lr_now, global_step)
                     if verbose:
                         print(f"Step {global_step} loss: {accumulated_loss}")
 
@@ -500,7 +537,10 @@ def train_model(
 
                 if global_step % cfg.save_steps == 0 and global_step > 0:
                     if rank == 0:
-                        model.save_pretrained(f"{cfg.save_dir}/step_{global_step}")
+                        checkpoint_dir = f"{cfg.save_dir}/step_{global_step}"
+                        model.save_pretrained(checkpoint_dir)
+                        assert run_logger is not None
+                        run_logger.info("Saved checkpoint: %s", checkpoint_dir)
                         if cfg.hf_push_to_hub and cfg.hf_repo_id:
                             print("Pushing LoRA adapter to Hugging Face Hub...")
                             push_lora_to_hf(
@@ -521,12 +561,18 @@ def train_model(
     # Save final model
     if rank == 0:
         print("Saving final model...")
-        model.save_pretrained(f"{cfg.save_dir}/final")
+        final_checkpoint_dir = f"{cfg.save_dir}/final"
+        model.save_pretrained(final_checkpoint_dir)
+        assert run_logger is not None
+        run_logger.info("Saved final checkpoint: %s", final_checkpoint_dir)
 
         # Final evaluation
         print("Running final evaluation...")
         _record_eval_and_write_html(global_step)
         wandb.finish()
+        assert tensorboard is not None
+        tensorboard.close()
+        run_logger.info("Run complete at step %d", global_step)
 
         # Push to Hugging Face if configured
         if cfg.hf_push_to_hub and cfg.hf_repo_id:
@@ -614,6 +660,7 @@ def mk_cfg(
     layer_percents: list[int],
     save_acts: bool,
     batch_size: int,
+    dataset_folder: str = "data/cache",
 ) -> DatasetLoaderConfig:
     return DatasetLoaderConfig(
         custom_dataset_params=custom_params,
@@ -624,6 +671,7 @@ def mk_cfg(
         layer_percents=layer_percents,
         save_acts=save_acts,
         batch_size=batch_size,
+        dataset_folder=dataset_folder,
     )
 
 
@@ -856,7 +904,13 @@ if __name__ == "__main__":
     dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
+    run_id_value = os.environ.get("AO_RUN_ID")
+    run_id_holder = [run_id_value or datetime.now().strftime("%Y%m%d_%H%M%S")] if rank == 0 else [None]
+    dist.broadcast_object_list(run_id_holder, src=0)
+    run_id = run_id_holder[0]
+    assert isinstance(run_id, str)
 
     main_train_size = 6000
     main_test_size = 250
@@ -956,6 +1010,7 @@ if __name__ == "__main__":
                     layer_percents=layer_percents,
                     save_acts=False,
                     batch_size=train_batch_size,
+                    dataset_folder="data/train/cache",
                 )
             )
             snli_ve_loader = SNLIVEDatasetLoader(
@@ -968,6 +1023,7 @@ if __name__ == "__main__":
                     layer_percents=layer_percents,
                     save_acts=True,
                     batch_size=max(1, min(4, train_batch_size)),
+                    dataset_folder="data/val/cache",
                 ),
                 model_kwargs=model_kwargs,
             )
@@ -1019,18 +1075,26 @@ if __name__ == "__main__":
                 eval_on_start=True,
                 gradient_checkpointing=gradient_checkpointing,
                 gradient_accumulation_steps=gradient_accumulation_steps,
+                run_id=run_id,
             )
             cfg_kwargs.update(hyperparam_override)
             cfg = SelfInterpTrainingConfig(**cfg_kwargs)
 
             cfg.finalize(dataset_loaders=loop_dataset_loaders)
 
+            if rank == 0:
+                Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
+                Path(cfg.tensorboard_dir).mkdir(parents=True, exist_ok=True)
+                Path(cfg.result_log_path).touch()
+            dist.barrier()
+
+            print(f"run dir: {cfg.run_dir}")
             print(f"save dir: {cfg.save_dir}")
 
             tokenizer = load_tokenizer(cfg.model_name)
 
             # Ensure only rank 0 performs any on-disk dataset creation
-            if local_rank == 0:
+            if rank == 0:
                 _ensure_datasets_exist(loop_dataset_loaders)
             dist.barrier()
 
