@@ -48,6 +48,7 @@ from nl_probes.utils.dataset_utils import (
     materialize_missing_steering_vectors,
 )
 from nl_probes.utils.eval import run_evaluation, score_eval_responses
+from nl_probes.utils.results_html import ResultsHtmlLogger
 
 
 def push_lora_to_hf(
@@ -236,7 +237,7 @@ def eval_all_datasets(
     dtype: torch.dtype,
     global_step: int,
     processor=None,
-) -> None:
+) -> dict[str, float]:
     model.eval()
     eval_results = {}
     for ds in eval_datasets:
@@ -269,6 +270,7 @@ def eval_all_datasets(
     # Have occasionally seen OOMs on first training step after eval, so clear cache here
     torch.cuda.empty_cache()
     gc.collect()
+    return eval_results
 
 
 def oom_preflight_check(
@@ -412,6 +414,29 @@ def train_model(
     # --------------------------------------------------------------
 
     global_step = 0
+    results_log = ResultsHtmlLogger() if rank == 0 else None
+
+    def _record_eval_and_write_html(step: int) -> None:
+        if results_log is None:
+            return
+        metrics = eval_all_datasets(
+            cfg,
+            eval_datasets,
+            model,
+            tokenizer,
+            submodule,
+            device,
+            dtype,
+            step,
+            processor=processor,
+        )
+        results_log.append_eval(
+            step,
+            metrics,
+            n_by_dataset={name: len(items) for name, items in eval_datasets.items()},
+        )
+        html_path = results_log.write(cfg)
+        print(f"Wrote results HTML: {html_path.resolve()}")
 
     # Init Weights & Biases only on rank 0
     if rank == 0:
@@ -454,30 +479,23 @@ def train_model(
                 optimizer.zero_grad()
 
                 if rank == 0:
+                    lr_now = scheduler.get_last_lr()[0]
                     wandb.log(
                         {
                             "train/loss": accumulated_loss,
-                            "train/learning_rate": scheduler.get_last_lr()[0],
+                            "train/learning_rate": lr_now,
                         },
                         step=global_step,
                     )
+                    if results_log is not None:
+                        results_log.append_loss(global_step, accumulated_loss, lr_now)
                     if verbose:
                         print(f"Step {global_step} loss: {accumulated_loss}")
 
                 # -------------------------------- evaluation --------------------------------
                 if global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
                     if rank == 0:
-                        eval_all_datasets(
-                            cfg,
-                            eval_datasets,
-                            model,
-                            tokenizer,
-                            submodule,
-                            device,
-                            dtype,
-                            global_step,
-                            processor=processor,
-                        )
+                        _record_eval_and_write_html(global_step)
                     dist.barrier()
 
                 if global_step % cfg.save_steps == 0 and global_step > 0:
@@ -507,9 +525,7 @@ def train_model(
 
         # Final evaluation
         print("Running final evaluation...")
-        eval_all_datasets(
-            cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step, processor=processor
-        )
+        _record_eval_and_write_html(global_step)
         wandb.finish()
 
         # Push to Hugging Face if configured

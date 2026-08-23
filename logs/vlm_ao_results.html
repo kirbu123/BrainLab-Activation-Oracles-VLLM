@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Visual AO · SNLI-VE results</title>
+  <style>
+    :root {
+      --bg: #111113;
+      --fg: #ececec;
+      --muted: #9a9aa3;
+      --line: #2a2a2e;
+      --card: #1a1a1d;
+      --accent: #79b8ff;
+      --good: #7dcea0;
+      --warn: #e6b84d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      padding: 32px 28px 64px;
+      max-width: 1100px;
+    }
+    h1 { font-size: 22px; font-weight: 600; margin: 0 0 6px; }
+    h2 { font-size: 16px; font-weight: 600; margin: 28px 0 8px; }
+    .sub { color: var(--muted); margin: 0 0 24px; }
+    .caption { color: var(--muted); font-size: 12px; margin: 4px 0 12px; }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 16px 0 8px; }
+    .stat { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .stat b { display: block; font-size: 22px; font-weight: 600; }
+    .stat span { color: var(--muted); font-size: 12px; }
+    .good { color: var(--good); }
+    .note {
+      border: 1px solid var(--line);
+      background: var(--card);
+      border-radius: 8px;
+      padding: 12px 14px;
+      color: var(--muted);
+      margin: 16px 0;
+    }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { text-align: right; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+    th:first-child, td:first-child { text-align: left; }
+    th { color: var(--muted); font-weight: 500; font-size: 12px; }
+    .peak { color: var(--good); }
+    svg { display: block; width: 100%; height: auto; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    @media (max-width: 800px) { .stats, .grid2 { grid-template-columns: 1fr 1fr; } }
+  </style>
+</head>
+<body>
+  <h1>Visual AO · SNLI-VE val</h1>
+  <p class="sub">Qwen3-VL-4B-Instruct · Visual SPQA train · run <code>pgx4nsa8</code> · 20 Aug 2026 11:00–12:43 · 4×H100 · 9,366 steps</p>
+
+  <div class="stats">
+    <div class="stat"><b class="good">58.8%</b><span>Final SNLI-VE accuracy</span></div>
+    <div class="stat"><b>+8.9 pp</b><span>Lift vs step-0 chance</span></div>
+    <div class="stat"><b>60.0%</b><span>Peak (step 8000)</span></div>
+    <div class="stat"><b class="good">100%</b><span>Yes/No format, all evals</span></div>
+  </div>
+
+  <p class="note">The oracle never sees the image at eval. It is steered with frozen Qwen3-VL residual activations (Flickr30k + hypothesis) and must answer Yes/No. 1,500 items = 250 pairs × 2 paraphrases × layers 9/18/27. Chance is 50%. Final 882/1500 = 58.8%.</p>
+
+  <h2>SNLI-VE answer accuracy</h2>
+  <p class="caption">Source: wandb/offline-run-20260820_110033-pgx4nsa8 · percent correct · dashed line = 50% chance</p>
+  <svg viewBox="0 0 640 280" role="img" aria-label="SNLI-VE accuracy over steps">
+    <line x1="56" y1="40" x2="56" y2="230" stroke="#2a2a2e" />
+    <line x1="56" y1="230" x2="610" y2="230" stroke="#2a2a2e" />
+    <!-- y 45% at 230, 100% at 40 → 50% = 230 - (5/55)*190 = 212.7 -->
+    <line x1="56" y1="213" x2="610" y2="213" stroke="#e6b84d" stroke-dasharray="4 4" />
+    <text x="616" y="217" fill="#e6b84d" font-size="11">chance 50%</text>
+    <text x="8" y="44" fill="#9a9aa3" font-size="11">100%</text>
+    <text x="14" y="234" fill="#9a9aa3" font-size="11">45%</text>
+    <!-- steps 0,2000,4000,6000,8000,9366 mapped 56..610 -->
+    <!-- x = 56 + (step/9366)*554 -->
+    <!-- y = 230 - ((acc-45)/55)*190 -->
+    <polyline fill="none" stroke="#7dcea0" stroke-width="2"
+      points="56,213.3 174,192.6 292,185.9 411,184.8 529,178.2 610,182.3" />
+    <g fill="#7dcea0">
+      <circle cx="56" cy="213.3" r="4" />
+      <circle cx="174" cy="192.6" r="4" />
+      <circle cx="292" cy="185.9" r="4" />
+      <circle cx="411" cy="184.8" r="4" />
+      <circle cx="529" cy="178.2" r="4" />
+      <circle cx="610" cy="182.3" r="4" />
+    </g>
+    <g fill="#ececec" font-size="11" text-anchor="middle">
+      <text x="56" y="248">0</text>
+      <text x="174" y="248">2000</text>
+      <text x="292" y="248">4000</text>
+      <text x="411" y="248">6000</text>
+      <text x="529" y="248">8000</text>
+      <text x="610" y="248">9366</text>
+    </g>
+    <text x="56" y="204" fill="#7dcea0" font-size="11">49.9%</text>
+    <text x="500" y="168" fill="#7dcea0" font-size="11">60.0%</text>
+    <text x="575" y="172" fill="#7dcea0" font-size="11">58.8%</text>
+    <text x="320" y="272" fill="#9a9aa3" font-size="11" text-anchor="middle">Optimizer step</text>
+  </svg>
+
+  <h2>Train CE loss (Visual SPQA)</h2>
+  <p class="caption">One point every 250 steps · raw min 0.57, max 4.86 · last-200 mean 1.36</p>
+  <svg viewBox="0 0 640 260" role="img" aria-label="Training cross-entropy loss">
+    <line x1="56" y1="30" x2="56" y2="210" stroke="#2a2a2e" />
+    <line x1="56" y1="210" x2="610" y2="210" stroke="#2a2a2e" />
+    <text x="18" y="34" fill="#9a9aa3" font-size="11">4.0</text>
+    <text x="18" y="214" fill="#9a9aa3" font-size="11">0.8</text>
+    <!-- y: loss 0.8 at 210, 4.0 at 30; y = 210 - ((L-0.8)/3.2)*180 -->
+    <polyline fill="none" stroke="#79b8ff" stroke-width="1.8"
+      points="56,60.5 71,139.2 86,179.4 101,182.0 116,168.4 131,163.2 146,152.9 161,172.1 176,180.2 191,183.1 206,181.6 221,164.9 236,180.1 251,171.2 266,160.4 281,163.7 296,180.0 311,156.3 326,171.8 341,197.1 356,181.0 371,171.9 386,172.2 401,177.3 416,163.5 431,176.1 446,177.3 461,159.7 476,164.3 491,187.9 506,178.8 521,166.6 536,180.9 551,169.8 566,160.0 581,176.9 596,189.0 603,186.6 610,179.3" />
+    <text x="320" y="248" fill="#9a9aa3" font-size="11" text-anchor="middle">Optimizer step (0 → 9365)</text>
+  </svg>
+
+  <div class="grid2" style="margin-top:28px">
+    <div>
+      <h2>Eval log</h2>
+      <table>
+        <thead><tr><th>Step</th><th>Ans acc.</th><th>Correct / 1500</th><th>Format</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>49.87%</td><td>748</td><td>100%</td></tr>
+          <tr><td>2000</td><td>55.87%</td><td>838</td><td>100%</td></tr>
+          <tr><td>4000</td><td>57.80%</td><td>867</td><td>100%</td></tr>
+          <tr><td>6000</td><td>58.13%</td><td>872</td><td>100%</td></tr>
+          <tr class="peak"><td>8000</td><td>60.00%</td><td>900</td><td>100%</td></tr>
+          <tr><td>9366 (final)</td><td>58.80%</td><td>882</td><td>100%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div>
+      <h2>Artifacts</h2>
+      <table>
+        <thead><tr><th>Item</th><th>Path</th></tr></thead>
+        <tbody>
+          <tr><td>Final LoRA</td><td>checkpoints_visual_spqa_snlive_Qwen3-VL-4B-Instruct/final/</td></tr>
+          <tr><td>Step 5000</td><td>checkpoints_visual_spqa_snlive_Qwen3-VL-4B-Instruct/step_5000/</td></tr>
+          <tr><td>WandB file</td><td>wandb/offline-run-20260820_110033-pgx4nsa8/</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>

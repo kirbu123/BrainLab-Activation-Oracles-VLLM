@@ -1,5 +1,6 @@
 import datetime
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from huggingface_hub import login, whoami
@@ -48,6 +49,7 @@ class SelfInterpTrainingConfig:
     save_dir: str = "checkpoints"
     seed: int = 42
     eval_logs_path: str = "eval_logs.json"
+    results_html_path: str = "logs/train_results.html"
     load_lora_path: str | None = None
 
     # --- Tracking ---
@@ -79,6 +81,11 @@ class SelfInterpTrainingConfig:
         # save dir namespacing
         if self.wandb_suffix and not self.save_dir.endswith(self.wandb_suffix):
             self.save_dir = f"{self.save_dir}{self.wandb_suffix}"
+
+        if self.wandb_suffix:
+            html_path = Path(self.results_html_path)
+            if not html_path.stem.endswith(self.wandb_suffix):
+                self.results_html_path = str(html_path.with_name(f"{html_path.stem}{self.wandb_suffix}{html_path.suffix}"))
 
         # repo id if pushing
         if self.hf_push_to_hub and not self.hf_repo_id:
