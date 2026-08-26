@@ -167,14 +167,14 @@ def parse_answer(answer: str) -> str:
 def score_eval_responses(
     eval_responses: list[FeatureResult],
     eval_dataset: list[TrainingDataPoint],
-    valid_answers: list[str] = ["yes", "no"],
+    valid_answers: list[str] | None = None,
 ) -> tuple[float, float]:
     format_correct_list = []
     ans_correct_list = []
     for eval_response, eval_data_point in zip(eval_responses, eval_dataset, strict=True):
         cleaned_response = parse_answer(eval_response.api_response)
         target_response = parse_answer(eval_data_point.target_output)
-        format_correct = cleaned_response in valid_answers
+        format_correct = bool(cleaned_response) if valid_answers is None else cleaned_response in valid_answers
         ans_correct = cleaned_response == target_response
         format_correct_list.append(format_correct)
         ans_correct_list.append(ans_correct)

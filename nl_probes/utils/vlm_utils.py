@@ -8,7 +8,50 @@ from typing import Any
 import torch
 from PIL import Image
 
+LEGACY_COCO_IMAGE_PREFIXES = (
+    ("data/coco/train2017/", "data/train/coco/train2017/"),
+    ("data/coco/val2017/", "data/val/coco/val2017/"),
+)
+
+
+def vlm_image_path_candidates(image: str) -> tuple[str, ...]:
+    path = image[2:] if image.startswith("./") else image
+    candidates = [path]
+    for old_prefix, new_prefix in LEGACY_COCO_IMAGE_PREFIXES:
+        if path.startswith(old_prefix):
+            candidates.append(new_prefix + path[len(old_prefix) :])
+    return tuple(dict.fromkeys(candidates))
+
+
+def resolve_vlm_image_path(image: str) -> str:
+    tried = vlm_image_path_candidates(image)
+    for candidate in tried:
+        if Path(candidate).is_file():
+            return candidate
+    raise FileNotFoundError(f"VLM image not found. Tried: {list(tried)}")
+
+
+def messages_with_resolved_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rewritten: list[dict[str, Any]] = []
+    for message in messages:
+        msg = dict(message)
+        content = msg.get("content")
+        if isinstance(content, list):
+            new_content = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image":
+                    part = dict(part)
+                    key = "image" if "image" in part else "path"
+                    if isinstance(part.get(key), str):
+                        part[key] = resolve_vlm_image_path(part[key])
+                new_content.append(part)
+            msg["content"] = new_content
+        rewritten.append(msg)
+    return rewritten
+
+
 DEFAULT_MAX_PIXELS = 1280 * 28 * 28
+
 VLM_FORWARD_KEYS = {
     "input_ids",
     "attention_mask",
@@ -44,16 +87,16 @@ def extract_image_paths(messages: list[dict[str, Any]]) -> list[str]:
                 continue
             image = part.get("image") or part.get("path")
             if isinstance(image, str):
-                paths.append(image)
+                paths.append(resolve_vlm_image_path(image))
             elif isinstance(image, Path):
-                paths.append(str(image))
+                paths.append(resolve_vlm_image_path(str(image)))
     return paths
 
 
 def _load_pil_images(image_paths: list[str]) -> list[Image.Image]:
     images = []
     for path in image_paths:
-        with Image.open(path) as img:
+        with Image.open(resolve_vlm_image_path(path)) as img:
             images.append(img.convert("RGB"))
     return images
 
@@ -81,6 +124,7 @@ def vlm_tokenize_target(
     Returns (unpadded input_ids, processor batch dict on CPU).
     """
     _maybe_set_max_pixels(processor, max_pixels)
+    messages = messages_with_resolved_images(messages)
     image_paths = extract_image_paths(messages)
 
     try:

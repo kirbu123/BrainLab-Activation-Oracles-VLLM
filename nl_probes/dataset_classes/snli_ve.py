@@ -8,21 +8,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import torch
-from tqdm import tqdm
-
-from nl_probes.dataset_classes.act_dataset_manager import (
-    ActDatasetLoader,
-    BaseDatasetConfig,
-    DatasetLoaderConfig,
+from nl_probes.dataset_classes.act_dataset_manager import DatasetLoaderConfig
+from nl_probes.dataset_classes.vlm_binary import (
+    NO_TOKEN,
+    YES_TOKEN,
+    VLMBinaryDatasetConfig,
+    VLMBinaryDatasetLoader,
+    VLMBinaryRecord,
+    create_vlm_binary_vector_dataset,
 )
-from nl_probes.utils.activation_utils import collect_activations_multiple_layers, get_hf_submodule
-from nl_probes.utils.common import layer_percent_to_layer, load_model, load_processor, load_tokenizer, set_seed
-from nl_probes.utils.dataset_utils import TrainingDataPoint, create_training_datapoint
-from nl_probes.utils.vlm_utils import DEFAULT_MAX_PIXELS, extract_image_paths, vision_inputs_to_device, vlm_tokenize_target
-
-YES_TOKEN = "Yes"
-NO_TOKEN = "No"
+from nl_probes.utils.dataset_utils import TrainingDataPoint
 
 SNLI_VE_PARAPHRASES = [
     "Does the image entail this statement?",
@@ -36,68 +31,73 @@ SNLI_VE_PARAPHRASES = [
 
 
 @dataclass
-class SNLIVEDatasetConfig(BaseDatasetConfig):
+class SNLIVEDatasetConfig(VLMBinaryDatasetConfig):
+    train_annotations_path: str = "data/train/snli_ve/snli_ve_train.jsonl"
+    train_flickr_image_dir: str = "data/train/flickr30k/flickr30k-images"
     annotations_path: str = "data/val/snli_ve/snli_ve_dev.jsonl"
     flickr_image_dir: str = "data/val/flickr30k/flickr30k-images"
     num_qa_per_sample: int = 2
-    min_end_offset: int = -1
-    max_end_offset: int = -5
-    max_window_size: int = 5
-    min_window_size: int = 1
-    max_pixels: int = DEFAULT_MAX_PIXELS
     drop_neutral: bool = True
 
 
-class SNLIVEDatasetLoader(ActDatasetLoader):
-    def __init__(self, dataset_config: DatasetLoaderConfig, model_kwargs: dict[str, Any] | None = None):
-        super().__init__(dataset_config)
-        assert self.dataset_config.dataset_name == "", "SNLI-VE dataset name gets overridden here"
-        self.dataset_config.dataset_name = "classification_snli_ve"
-        self.dataset_params: SNLIVEDatasetConfig = dataset_config.custom_dataset_params
-        self.model_kwargs = model_kwargs or {}
+class SNLIVEDatasetLoader(VLMBinaryDatasetLoader):
+    dataset_name = "classification_snli_ve"
 
-    def create_dataset(self) -> None:
-        set_seed(self.dataset_config.seed)
-        tokenizer = load_tokenizer(self.dataset_config.model_name)
-        processor = load_processor(self.dataset_config.model_name)
-        layers = [
-            layer_percent_to_layer(self.dataset_config.model_name, layer_percent)
-            for layer_percent in self.dataset_config.layer_percents
+    def records_for_split(self, split: str) -> list[VLMBinaryRecord]:
+        params: SNLIVEDatasetConfig = self.dataset_params
+        if split == "train":
+            raw_records = load_snli_ve_records(
+                params.train_annotations_path,
+                params.train_flickr_image_dir,
+                drop_neutral=params.drop_neutral,
+                hf_split="train",
+            )
+        else:
+            raw_records = load_snli_ve_records(
+                params.annotations_path,
+                params.flickr_image_dir,
+                drop_neutral=params.drop_neutral,
+                hf_split="validation",
+            )
+        return [
+            VLMBinaryRecord(
+                source_id=record["flickr_id"],
+                image_path=record["image_path"],
+                context_text=record["hypothesis"],
+                question=record["hypothesis"],
+                answer=record["answer"],
+                metadata={"flickr_id": record["flickr_id"], "hypothesis": record["hypothesis"]},
+            )
+            for record in raw_records
         ]
 
-        records = load_snli_ve_records(
-            self.dataset_params.annotations_path,
-            self.dataset_params.flickr_image_dir,
-            drop_neutral=self.dataset_params.drop_neutral,
-        )
-        if not records:
-            raise FileNotFoundError(
-                "No SNLI-VE records with images. Run scripts/download_vlm_ao_data.sh"
-            )
+    def default_num_records(self, split: str, available: int) -> int:
+        return min(500, available)
 
-        rng = random.Random(self.dataset_config.seed)
-        rng.shuffle(records)
-
-        n_test = self.dataset_config.num_test
-        if n_test <= 0 or n_test > len(records):
-            n_test = min(500, len(records))
-        test_records = records[:n_test]
-
-        datapoints = records_to_datapoints(test_records, self.dataset_params, rng)
-        data = create_snli_ve_vector_dataset(
-            datapoints=datapoints,
-            processor=processor,
-            tokenizer=tokenizer,
-            model_name=self.dataset_config.model_name,
-            act_layers=layers,
-            dataset_params=self.dataset_params,
-            save_acts=self.dataset_config.save_acts,
-            batch_size=max(1, self.dataset_config.batch_size),
-            model_kwargs=self.model_kwargs,
-            rng=rng,
-        )
-        if "test" in self.dataset_config.splits:
-            self.save_dataset(data, "test")
+    def expand_records(
+        self,
+        records: list[VLMBinaryRecord],
+        rng: random.Random,
+    ) -> list[VLMBinaryRecord]:
+        params: SNLIVEDatasetConfig = self.dataset_params
+        n_paraphrases = min(params.num_qa_per_sample, len(SNLI_VE_PARAPHRASES))
+        expanded = []
+        for record in records:
+            for paraphrase in rng.sample(SNLI_VE_PARAPHRASES, n_paraphrases):
+                expanded.append(
+                    VLMBinaryRecord(
+                        source_id=record.source_id,
+                        image_path=record.image_path,
+                        context_text=record.context_text,
+                        question=(
+                            "Answer with 'Yes' or 'No' only. "
+                            f"# {paraphrase} {record.context_text}"
+                        ),
+                        answer=record.answer,
+                        metadata=record.metadata,
+                    )
+                )
+        return expanded
 
 
 def _label_to_yes_no(label: str | int) -> str | None:
@@ -174,13 +174,18 @@ def _load_json_records(path: Path) -> list[dict]:
     return raw
 
 
-def load_snli_ve_records(annotations_path: str, flickr_dir: str, drop_neutral: bool = True) -> list[dict]:
+def load_snli_ve_records(
+    annotations_path: str,
+    flickr_dir: str,
+    drop_neutral: bool = True,
+    hf_split: str = "validation",
+) -> list[dict]:
     path = Path(annotations_path)
     records_raw: list[dict] = []
     if path.exists():
         records_raw = _load_json_records(path)
     else:
-        records_raw = _try_huggingface_snli_ve()
+        records_raw = _try_huggingface_snli_ve(hf_split)
 
     flickr_root = Path(flickr_dir)
     kept = []
@@ -211,15 +216,12 @@ def load_snli_ve_records(annotations_path: str, flickr_dir: str, drop_neutral: b
     return kept
 
 
-def _try_huggingface_snli_ve() -> list[dict]:
+def _try_huggingface_snli_ve(split: str = "validation") -> list[dict]:
     try:
         from datasets import load_dataset
     except ImportError:
         return []
-    for repo, split in (
-        ("HuggingFaceM4/SNLI-VE", "validation"),
-        ("nlphuji/snli_ve", "validation"),
-    ):
+    for repo in ("HuggingFaceM4/SNLI-VE", "nlphuji/snli_ve"):
         try:
             ds = load_dataset(repo, split=split)
             return [dict(row) for row in ds]
@@ -263,79 +265,27 @@ def create_snli_ve_vector_dataset(
     model_kwargs: dict[str, Any],
     rng: random.Random,
 ) -> list[TrainingDataPoint]:
-    model = None
-    submodules = None
-    device = torch.device("cpu")
-    if save_acts:
-        model = load_model(model_name, torch.bfloat16, **model_kwargs)
-        model.eval()
-        submodules = {layer: get_hf_submodule(model, layer) for layer in act_layers}
-        device = next(model.parameters()).device
-
-    training_data: list[TrainingDataPoint] = []
-    for i in tqdm(range(0, len(datapoints), batch_size), desc="SNLI-VE vector dataset"):
-        batch = datapoints[i : i + batch_size]
-        for dp in batch:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": dp["image_path"]},
-                        {"type": "text", "text": dp["hypothesis"]},
-                    ],
-                }
-            ]
-            context_input_ids, proc_inputs = vlm_tokenize_target(
-                processor,
-                messages,
-                add_generation_prompt=True,
-                max_pixels=dataset_params.max_pixels,
-            )
-            L = len(context_input_ids)
-            end_offset = rng.randint(dataset_params.max_end_offset, dataset_params.min_end_offset)
-            end_pos = L + end_offset
-            end_pos = max(1, min(end_pos, L - 1 if L > 1 else 0))
-            k = rng.randint(dataset_params.min_window_size, dataset_params.max_window_size)
-            k = min(k, end_pos + 1)
-            k = max(k, 1)
-            begin_pos = end_pos - k + 1
-            positions_K = list(range(begin_pos, end_pos + 1))
-
-            acts_by_layer = None
-            if save_acts:
-                inputs_BL = vision_inputs_to_device(proc_inputs, device)
-                with torch.no_grad():
-                    acts_by_layer = collect_activations_multiple_layers(
-                        model,
-                        submodules,
-                        inputs_BL,
-                        None,
-                        None,
-                    )
-
-            for layer in act_layers:
-                acts_KD = None
-                if save_acts:
-                    acts_KD = acts_by_layer[layer][0, positions_K].detach().contiguous()
-                training_data.append(
-                    create_training_datapoint(
-                        datapoint_type="classification_snli_ve",
-                        prompt=dp["question"],
-                        target_response=dp["answer"],
-                        layer=layer,
-                        num_positions=len(positions_K),
-                        tokenizer=tokenizer,
-                        acts_BD=acts_KD,
-                        feature_idx=-1,
-                        context_input_ids=context_input_ids,
-                        context_positions=positions_K,
-                        context_image_paths=extract_image_paths(messages),
-                        ds_label=dp["answer"],
-                        meta_info={
-                            "target_messages": messages,
-                            "add_generation_prompt": True,
-                            "flickr_id": dp["flickr_id"],
-                        },
-                    )
-                )
-    return training_data
+    records = [
+        VLMBinaryRecord(
+            source_id=datapoint["flickr_id"],
+            image_path=datapoint["image_path"],
+            context_text=datapoint["hypothesis"],
+            question=datapoint["question"],
+            answer=datapoint["answer"],
+            metadata={"flickr_id": datapoint["flickr_id"]},
+        )
+        for datapoint in datapoints
+    ]
+    return create_vlm_binary_vector_dataset(
+        records=records,
+        processor=processor,
+        tokenizer=tokenizer,
+        model_name=model_name,
+        act_layers=act_layers,
+        dataset_params=dataset_params,
+        datapoint_type="classification_snli_ve",
+        save_acts=save_acts,
+        batch_size=batch_size,
+        model_kwargs=model_kwargs,
+        rng=rng,
+    )

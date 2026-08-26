@@ -304,9 +304,13 @@ def _materialize_image_items(
                 )
                 inputs_BL = vision_inputs_to_device(proc_inputs, device)
             else:
+                from nl_probes.utils.vlm_utils import resolve_vlm_image_path
                 from PIL import Image
 
-                images = [Image.open(p).convert("RGB") for p in dp.context_image_paths]
+                images = [
+                    Image.open(resolve_vlm_image_path(p)).convert("RGB")
+                    for p in dp.context_image_paths
+                ]
                 image_processor = getattr(processor, "image_processor", processor)
                 vision = image_processor(images=images, return_tensors="pt")
                 input_ids = torch.tensor([dp.context_input_ids], dtype=torch.long, device=device)

@@ -2,6 +2,8 @@
 unsloth_compiled_cache/
 
 wandb/
+/logs/
+/targets/
 .data/
 .checkpoints/
 # Byte-compiled / optimized / DLL files
@@ -200,3 +202,9 @@ data/*
 data/train/*
 !data/train/latentqa/
 !data/train/latentqa/*.json
+
+# Keep target-organism generator source while generated datasets stay ignored.
+!nl_probes/target_data/
+!nl_probes/target_data/*.py
+!scripts/target/
+!scripts/target/*.sh

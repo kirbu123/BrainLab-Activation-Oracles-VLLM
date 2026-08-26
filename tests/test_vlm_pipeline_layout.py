@@ -1,8 +1,12 @@
 from pathlib import Path
 
 from nl_probes.configs.sft_config import SelfInterpTrainingConfig
+from nl_probes.dataset_classes.coco_captions_past_lens_dataset import CocoCaptionsPastLensDatasetConfig
+from nl_probes.dataset_classes.coco_presence import COCOObjectPresenceDatasetConfig
+from nl_probes.dataset_classes.gqa_yesno import GQAYesNoDatasetConfig
 from nl_probes.dataset_classes.snli_ve import SNLIVEDatasetConfig
 from nl_probes.dataset_classes.visual_spqa_dataset import VisualSPQADatasetConfig
+from nl_probes.dataset_classes.vsr import VSRDatasetConfig
 
 
 def test_vlm_source_data_is_split_between_train_and_val():
@@ -14,6 +18,28 @@ def test_vlm_source_data_is_split_between_train_and_val():
     assert Path(train.latentqa_dir).parts[:2] == ("data", "train")
     assert Path(val.annotations_path).parts[:2] == ("data", "val")
     assert Path(val.flickr_image_dir).parts[:2] == ("data", "val")
+
+    split_configs = [
+        VSRDatasetConfig(),
+        GQAYesNoDatasetConfig(),
+        COCOObjectPresenceDatasetConfig(),
+        CocoCaptionsPastLensDatasetConfig(),
+    ]
+    for config in split_configs:
+        train_paths = [
+            value
+            for name, value in vars(config).items()
+            if ("train" in name or name == "llava_json_path") and name.endswith(("_path", "_dir"))
+        ]
+        val_paths = [
+            value
+            for name, value in vars(config).items()
+            if ("test" in name or "val" in name) and name.endswith(("_path", "_dir"))
+        ]
+        assert train_paths
+        assert val_paths
+        assert all(Path(path).parts[:2] == ("data", "train") for path in train_paths)
+        assert all(Path(path).parts[:2] == ("data", "val") for path in val_paths)
 
 
 def test_run_artifacts_share_one_timestamped_directory():

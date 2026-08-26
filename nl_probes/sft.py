@@ -24,23 +24,44 @@ from transformers.optimization import get_linear_schedule_with_warmup
 import torch.distributed as dist
 import wandb
 
-import nl_probes.dataset_classes.classification as classification
 from nl_probes.utils.steering_hooks import (
     add_hook,
     get_hf_activation_steering_hook,
 )
 from nl_probes.configs.sft_config import SelfInterpTrainingConfig
-from nl_probes.dataset_classes.act_dataset_manager import ActDatasetLoader, DatasetLoaderConfig
-from nl_probes.dataset_classes.classification import (
-    ClassificationDatasetConfig,
-    ClassificationDatasetLoader,
+from nl_probes.configs.launch_args import (
+    compose_wandb_suffix,
+    parse_launch_args,
+    target_validation_enabled,
+    validation_enabled,
 )
-from nl_probes.dataset_classes.latentqa_dataset import LatentQADatasetConfig, LatentQADatasetLoader
-from nl_probes.dataset_classes.past_lens_dataset import PastLensDatasetConfig, PastLensDatasetLoader
+from nl_probes.dataset_classes.act_dataset_manager import ActDatasetLoader, DatasetLoaderConfig
+from nl_probes.dataset_classes.coco_captions_past_lens_dataset import (
+    CocoCaptionsPastLensDatasetConfig,
+    CocoCaptionsPastLensDatasetLoader,
+)
+from nl_probes.dataset_classes.coco_presence import (
+    COCOObjectPresenceDatasetConfig,
+    COCOObjectPresenceDatasetLoader,
+)
+from nl_probes.dataset_classes.gqa_yesno import GQAYesNoDatasetConfig, GQAYesNoDatasetLoader
 from nl_probes.dataset_classes.snli_ve import SNLIVEDatasetConfig, SNLIVEDatasetLoader
+from nl_probes.dataset_classes.target_organisms import (
+    ProbeSettings,
+    load_cached_target_validation_family,
+    precompute_target_validation_caches,
+)
 from nl_probes.dataset_classes.visual_spqa_dataset import VisualSPQADatasetConfig, VisualSPQADatasetLoader
+from nl_probes.dataset_classes.vsr import VSRDatasetConfig, VSRDatasetLoader
 from nl_probes.utils.activation_utils import get_hf_submodule, get_text_only_lora_targets, freeze_vision_parameters
-from nl_probes.utils.common import load_model, load_tokenizer, load_processor, set_seed, is_vlm_model
+from nl_probes.utils.common import (
+    is_vlm_model,
+    layer_percent_to_layer,
+    load_model,
+    load_processor,
+    load_tokenizer,
+    set_seed,
+)
 from nl_probes.utils.dataset_utils import (
     BatchData,
     EvalStepResult,
@@ -49,8 +70,12 @@ from nl_probes.utils.dataset_utils import (
     construct_batch,
     materialize_missing_steering_vectors,
 )
-from nl_probes.utils.eval import run_evaluation, score_eval_responses
+from nl_probes.utils.eval import parse_answer, run_evaluation, score_eval_responses
 from nl_probes.utils.results_html import ResultsHtmlLogger
+from nl_probes.utils.secret_keeping_scoring import (
+    aggregate_target_validation_scores,
+    score_target_validation_record,
+)
 
 
 def create_run_logger(log_path: str) -> logging.Logger:
@@ -268,7 +293,42 @@ def eval_all_datasets(
             generation_kwargs=cfg.generation_kwargs,
             processor=processor,
         )
-        percent_format_correct, percent_ans_correct = score_eval_responses(eval_responses, eval_datasets[ds])
+        is_target_validation = all(
+            item.meta_info and "scoring_mode" in item.meta_info
+            for item in eval_datasets[ds]
+        )
+        if is_target_validation:
+            scored_records = [
+                score_target_validation_record(response.api_response, item.meta_info)
+                for response, item in zip(eval_responses, eval_datasets[ds], strict=True)
+            ]
+            aggregate = aggregate_target_validation_scores(scored_records)
+            percent_format_correct = sum(
+                bool(parse_answer(response.api_response)) for response in eval_responses
+            ) / len(eval_responses)
+            percent_ans_correct = float(aggregate["overall"]["accuracy"])
+            details_path = Path(cfg.run_dir) / "target_validation_predictions.jsonl"
+            with details_path.open("a", encoding="utf-8") as handle:
+                for record in scored_records:
+                    handle.write(
+                        json.dumps(
+                            {"step": global_step, "dataset": ds, **record},
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
+            for ood_slice, metrics in aggregate["by_ood_slice"].items():
+                eval_results[f"eval_target_ood/{ds}/{ood_slice}"] = float(
+                    metrics["accuracy"]
+                )
+        else:
+            target_answers = {parse_answer(item.target_output) for item in eval_datasets[ds]}
+            valid_answers = ["yes", "no"] if target_answers <= {"yes", "no"} else None
+            percent_format_correct, percent_ans_correct = score_eval_responses(
+                eval_responses,
+                eval_datasets[ds],
+                valid_answers=valid_answers,
+            )
         eval_results[f"eval_format_correct/{ds}"] = percent_format_correct
         eval_results[f"eval_ans_correct/{ds}"] = percent_ans_correct
         print(f"Step {global_step} {ds} format correct: {percent_format_correct}, ans correct: {percent_ans_correct}")
@@ -530,7 +590,7 @@ def train_model(
                         print(f"Step {global_step} loss: {accumulated_loss}")
 
                 # -------------------------------- evaluation --------------------------------
-                if global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
+                if eval_datasets and global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
                     if rank == 0:
                         _record_eval_and_write_html(global_step)
                     dist.barrier()
@@ -567,8 +627,12 @@ def train_model(
         run_logger.info("Saved final checkpoint: %s", final_checkpoint_dir)
 
         # Final evaluation
-        print("Running final evaluation...")
-        _record_eval_and_write_html(global_step)
+        if eval_datasets:
+            print("Running final evaluation...")
+            _record_eval_and_write_html(global_step)
+        else:
+            assert results_log is not None
+            results_log.write(cfg)
         wandb.finish()
         assert tensorboard is not None
         tensorboard.close()
@@ -614,7 +678,7 @@ def build_datasets(
 ) -> tuple[list[TrainingDataPoint], dict[str, list[TrainingDataPoint]]]:
     set_seed(cfg.seed)
     all_training_data: list[TrainingDataPoint] = []
-    # eval data will only be for classification datasets
+    # Eval datasets are keyed independently for per-family reporting.
     all_eval_data: dict[str, list[TrainingDataPoint]] = {}
 
     for dataset_loader in dataset_loaders:
@@ -622,6 +686,10 @@ def build_datasets(
             all_training_data.extend(dataset_loader.load_dataset("train"))
         if "test" in dataset_loader.dataset_config.splits:
             all_eval_data[dataset_loader.dataset_config.dataset_name] = dataset_loader.load_dataset("test")
+
+    if not all_training_data:
+        selected = [loader.dataset_config.dataset_name for loader in dataset_loaders]
+        raise ValueError(f"Selected dataset loaders produced no training data: {selected}")
 
     p = max_len_percentile
     if p is not None:
@@ -647,6 +715,67 @@ def build_datasets(
         all_training_data = length_grouped_reorder(all_training_data, cfg.train_batch_size, window_mult)
 
     return all_training_data, all_eval_data
+
+
+TARGET_VALIDATION_MANIFESTS = {
+    "visual_taboo": "data/val/visual_taboo/validation_manifest.json",
+    "visual_user_attribute": "data/val/visual_user_attribute/validation_manifest.json",
+    "visual_ssc": "data/val/visual_ssc/validation_manifest.json",
+    "visual_personaqa": "data/val/visual_personaqa/validation_manifest.json",
+}
+
+
+def selected_target_validation_manifests(dataset_flags) -> list[str]:
+    selections = (
+        ("visual_taboo", dataset_flags.visual_taboo_val),
+        ("visual_user_attribute", dataset_flags.visual_user_attribute_val),
+        ("visual_ssc", dataset_flags.visual_ssc_val),
+        ("visual_personaqa", dataset_flags.visual_personaqa_val),
+    )
+    return [
+        TARGET_VALIDATION_MANIFESTS[family]
+        for family, enabled in selections
+        if enabled
+    ]
+
+
+def build_target_validation_datasets(
+    *,
+    dataset_flags,
+    model_name: str,
+    layer_percents: list[int],
+    rank: int,
+) -> dict[str, list[TrainingDataPoint]]:
+    manifest_paths = selected_target_validation_manifests(dataset_flags)
+    if not manifest_paths:
+        return {}
+
+    cache_paths_holder: list[dict[str, str] | None] = [None]
+    if rank == 0:
+        layers = tuple(
+            layer_percent_to_layer(model_name, layer_percent)
+            for layer_percent in layer_percents
+        )
+        outputs = precompute_target_validation_caches(
+            registry_path=dataset_flags.target_adapter_registry,
+            manifest_paths=manifest_paths,
+            settings=ProbeSettings(
+                layers=layers,
+                generate_target_response=False,
+            ),
+            cache_dir="data/val/cache",
+        )
+        cache_paths_holder[0] = {
+            family: str(cache_path) for family, cache_path in outputs.items()
+        }
+    dist.broadcast_object_list(cache_paths_holder, src=0)
+    cache_paths = cache_paths_holder[0]
+    if cache_paths is None:
+        raise RuntimeError("Rank 0 did not broadcast target-validation cache paths")
+    return {
+        family: load_cached_target_validation_family(cache_path, family)
+        for family, cache_path in cache_paths.items()
+    }
 
 
 # Helper to cut repetition when building DatasetLoaderConfig
@@ -684,6 +813,12 @@ def build_loader_groups(
     classification_datasets: dict[str, dict[str, Any]],
     model_kwargs: dict[str, Any],
 ) -> dict[str, list[ActDatasetLoader]]:
+    from nl_probes.dataset_classes.classification import (
+        ClassificationDatasetConfig,
+        ClassificationDatasetLoader,
+    )
+    from nl_probes.dataset_classes.latentqa_dataset import LatentQADatasetConfig, LatentQADatasetLoader
+    from nl_probes.dataset_classes.past_lens_dataset import PastLensDatasetConfig, PastLensDatasetLoader
     from nl_probes.dataset_classes.sae_training_data import (
         SAEActivatingSequencesDatasetConfig,
         SAEActivatingSequencesDatasetLoader,
@@ -714,7 +849,7 @@ def build_loader_groups(
             model_name=model_name,
             layer_percents=layer_percents,
             save_acts=save_acts,
-            batch_size=train_batch_size,
+            batch_size=act_collection_batch_size,
         )
     )
 
@@ -730,7 +865,7 @@ def build_loader_groups(
             model_name=model_name,
             layer_percents=layer_percents,
             save_acts=save_acts,
-            batch_size=train_batch_size,
+            batch_size=act_collection_batch_size,
         )
     )
 
@@ -743,7 +878,7 @@ def build_loader_groups(
             model_name=model_name,
             layer_percents=layer_percents,
             save_acts=False,
-            batch_size=train_batch_size,
+            batch_size=act_collection_batch_size,
         )
     )
 
@@ -828,7 +963,7 @@ def build_loader_groups(
         if "batch_size" in meta:
             bs = meta["batch_size"]
         else:
-            bs = train_batch_size
+            bs = act_collection_batch_size
 
         classification_loaders.append(
             ClassificationDatasetLoader(
@@ -856,7 +991,7 @@ def build_loader_groups(
                     model_name=model_name,
                     layer_percents=layer_percents,
                     save_acts=save_acts,
-                    batch_size=train_batch_size,
+                    batch_size=act_collection_batch_size,
                 ),
                 model_kwargs=model_kwargs,
             )
@@ -898,6 +1033,12 @@ def _ensure_datasets_exist(dataset_loaders: list[ActDatasetLoader]) -> None:
 
 
 if __name__ == "__main__":
+    dataset_flags = parse_launch_args()
+    if target_validation_enabled(dataset_flags) and not Path(dataset_flags.target_adapter_registry).is_file():
+        raise FileNotFoundError(
+            "Target-organism validation was enabled but its adapter registry is missing: "
+            f"{dataset_flags.target_adapter_registry}"
+        )
     # for gemma: export TORCHDYNAMO_DISABLE=1
     # Always initialize DDP (launch with torchrun, even for 1 GPU)
     # time delta of two hours because currently it can take 1 hour to build all datasets
@@ -1000,40 +1141,129 @@ if __name__ == "__main__":
         gradient_accumulation_steps = 1
 
         if is_vlm_model(model_name):
-            visual_spqa_loader = VisualSPQADatasetLoader(
-                dataset_config=mk_cfg(
-                    VisualSPQADatasetConfig(),
-                    num_train=150_000,
-                    num_test=0,
-                    splits=["train"],
-                    model_name=model_name,
-                    layer_percents=layer_percents,
-                    save_acts=False,
-                    batch_size=train_batch_size,
-                    dataset_folder="data/train/cache",
+            vlm_loaders: list[ActDatasetLoader] = []
+            eval_batch_size = max(1, min(4, train_batch_size))
+
+            if dataset_flags.visual_spqa:
+                vlm_loaders.append(
+                    VisualSPQADatasetLoader(
+                        dataset_config=mk_cfg(
+                            VisualSPQADatasetConfig(),
+                            num_train=150_000,
+                            num_test=0,
+                            splits=["train"],
+                            model_name=model_name,
+                            layer_percents=layer_percents,
+                            save_acts=False,
+                            batch_size=train_batch_size,
+                            dataset_folder="data/train/cache",
+                        )
+                    )
                 )
-            )
-            snli_ve_loader = SNLIVEDatasetLoader(
-                dataset_config=mk_cfg(
-                    SNLIVEDatasetConfig(),
-                    num_train=0,
-                    num_test=250,
-                    splits=["test"],
-                    model_name=model_name,
-                    layer_percents=layer_percents,
-                    save_acts=True,
-                    batch_size=max(1, min(4, train_batch_size)),
-                    dataset_folder="data/val/cache",
-                ),
-                model_kwargs=model_kwargs,
-            )
+
+            if dataset_flags.classification:
+                binary_specs = [
+                    (VSRDatasetLoader, VSRDatasetConfig),
+                    (GQAYesNoDatasetLoader, GQAYesNoDatasetConfig),
+                    (COCOObjectPresenceDatasetLoader, COCOObjectPresenceDatasetConfig),
+                ]
+                for loader_type, config_type in binary_specs:
+                    vlm_loaders.append(
+                        loader_type(
+                            dataset_config=mk_cfg(
+                                config_type(),
+                                num_train=6_000,
+                                num_test=0,
+                                splits=["train"],
+                                model_name=model_name,
+                                layer_percents=layer_percents,
+                                save_acts=False,
+                                batch_size=train_batch_size,
+                                dataset_folder="data/train/cache",
+                            ),
+                            model_kwargs=model_kwargs,
+                        )
+                    )
+                    vlm_loaders.append(
+                        loader_type(
+                            dataset_config=mk_cfg(
+                                config_type(),
+                                num_train=0,
+                                num_test=250,
+                                splits=["test"],
+                                model_name=model_name,
+                                layer_percents=layer_percents,
+                                save_acts=True,
+                                batch_size=eval_batch_size,
+                                dataset_folder="data/val/cache",
+                            ),
+                            model_kwargs=model_kwargs,
+                        )
+                    )
+
+            if dataset_flags.context_prediction:
+                for max_k_activations in (1, 50):
+                    vlm_loaders.append(
+                        CocoCaptionsPastLensDatasetLoader(
+                            dataset_config=mk_cfg(
+                                CocoCaptionsPastLensDatasetConfig(
+                                    max_k_tokens=50,
+                                    max_k_activations=max_k_activations,
+                                ),
+                                num_train=100_000,
+                                num_test=0,
+                                splits=["train"],
+                                model_name=model_name,
+                                layer_percents=layer_percents,
+                                save_acts=False,
+                                batch_size=train_batch_size,
+                                dataset_folder="data/train/cache",
+                            ),
+                            model_kwargs=model_kwargs,
+                        )
+                    )
+                vlm_loaders.append(
+                    CocoCaptionsPastLensDatasetLoader(
+                        dataset_config=mk_cfg(
+                            CocoCaptionsPastLensDatasetConfig(),
+                            num_train=0,
+                            num_test=250,
+                            splits=["test"],
+                            model_name=model_name,
+                            layer_percents=layer_percents,
+                            save_acts=True,
+                            batch_size=eval_batch_size,
+                            dataset_folder="data/val/cache",
+                        ),
+                        model_kwargs=model_kwargs,
+                    )
+                )
+
+            if dataset_flags.snli_ve:
+                vlm_loaders.append(
+                    SNLIVEDatasetLoader(
+                        dataset_config=mk_cfg(
+                            SNLIVEDatasetConfig(),
+                            num_train=0,
+                            num_test=250,
+                            splits=["test"],
+                            model_name=model_name,
+                            layer_percents=layer_percents,
+                            save_acts=True,
+                            batch_size=eval_batch_size,
+                            dataset_folder="data/val/cache",
+                        ),
+                        model_kwargs=model_kwargs,
+                    )
+                )
+
             iterations = [
                 {
                     "load_lora_path": None,
-                    "dataset_loaders": [visual_spqa_loader, snli_ve_loader],
-                    "wandb_suffix": f"_visual_spqa_snlive_{model_name_str}",
+                    "dataset_loaders": vlm_loaders,
+                    "wandb_suffix": compose_wandb_suffix(dataset_flags, model_name),
                     "eval_steps": 2000,
-                    "eval_on_start": True,
+                    "eval_on_start": validation_enabled(dataset_flags),
                     "activation_collection_batch_size": max(1, train_batch_size),
                     "eval_batch_size": max(8, train_batch_size * 4),
                 },
@@ -1075,6 +1305,8 @@ if __name__ == "__main__":
                 eval_on_start=True,
                 gradient_checkpointing=gradient_checkpointing,
                 gradient_accumulation_steps=gradient_accumulation_steps,
+                dataset_families=dataset_flags.as_dict(),
+                target_adapter_registry=dataset_flags.target_adapter_registry,
                 run_id=run_id,
             )
             cfg_kwargs.update(hyperparam_override)
@@ -1101,6 +1333,16 @@ if __name__ == "__main__":
             all_training_data, all_eval_data = build_datasets(
                 cfg, dataset_loaders=loop_dataset_loaders, window_mult=cfg.window_mult
             )
+            target_eval_data = build_target_validation_datasets(
+                dataset_flags=dataset_flags,
+                model_name=model_name,
+                layer_percents=layer_percents,
+                rank=rank,
+            )
+            overlap = set(all_eval_data) & set(target_eval_data)
+            if overlap:
+                raise ValueError(f"Duplicate validation dataset keys: {sorted(overlap)}")
+            all_eval_data.update(target_eval_data)
 
             # for debugging
             # all_training_data = all_training_data[:100]

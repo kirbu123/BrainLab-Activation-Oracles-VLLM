@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # 4x H100 Visual AO training. GPU ids default 0-3.
+# Dataset flags are forwarded, for example:
+#   bash scripts/run_vlm_ao_4gpu.sh --no-context-prediction --no-snli-ve
+# Target-organism validations are default-off and require --target-adapter-registry:
+#   bash scripts/run_vlm_ao_4gpu.sh --visual-taboo-val --target-adapter-registry path/to/registry.json
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"

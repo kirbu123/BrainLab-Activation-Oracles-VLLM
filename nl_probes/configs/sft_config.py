@@ -19,6 +19,8 @@ class SelfInterpTrainingConfig:
 
     # --- Data / experiment ---
     dataset_configs: list[dict] = field(default_factory=list)
+    dataset_families: dict[str, bool] = field(default_factory=dict)
+    target_adapter_registry: str = "data/val/target_organisms/adapter_registry.json"
     use_decoder_vectors: bool = True
     generation_kwargs: dict[str, Any] = field(default_factory=lambda: {"do_sample": False, "max_new_tokens": 20})
     steering_coefficient: float = 1.0

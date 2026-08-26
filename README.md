@@ -7,11 +7,18 @@ vision-language models. The current experiment trains a LoRA oracle on
 
 ## Current pipeline
 
-- **Training:** Visual SPQA, built from LLaVA-Instruct 150K, COCO images, and
+- **Visual SPQA training:** up to 150,000 LLaVA-Instruct/COCO examples with
   LatentQA hidden-instruction overlays.
-- **Validation:** 250 SNLI-VE entailment/contradiction pairs with Flickr30k
-  images. Two question paraphrases and three activation depths produce up to
-  1,500 validation items.
+- **Binary-classification training:** VSR spatial verification, GQA balanced
+  yes/no questions, and balanced COCO object-presence questions (up to 6,000
+  source records per dataset).
+- **Context-prediction training:** COCO captions in single-activation and
+  multi-activation modes (up to 100,000 items per mode).
+- **Validation:** held-out VSR, GQA, COCO object-presence, COCO-caption
+  context-prediction, and 250 SNLI-VE entailment/contradiction source records.
+- **Optional target-organism validation:** adapter-on Visual Taboo, randomized
+  user attribute, glyph-encoded SSC, and multi-view Visual PersonaQA. These
+  validations are disabled until their separate target LoRA adapters exist.
 - **Activation depths:** 25%, 50%, and 75% of the target model.
 - **Oracle:** text-side LoRA with rank 64, alpha 128, and dropout 0.05. The
   vision tower is frozen.
@@ -23,15 +30,24 @@ data/
 ├── train/
 │   ├── llava/llava_instruct_150k.json
 │   ├── coco/train2017/
+│   ├── coco/annotations/{captions,instances}_train2017.json
 │   ├── latentqa/{stimulus_completion,stimulus,control,qa}.json
-│   └── cache/                  # generated Visual SPQA cache
+│   ├── vsr/train.jsonl
+│   ├── gqa/{train_balanced_questions.json,images/}
+│   ├── visual_{taboo,user_attribute,ssc,personaqa}/
+│   └── cache/
 └── val/
+    ├── coco/{val2017/,annotations/}
+    ├── vsr/{dev,test}.jsonl
+    ├── gqa/{val_balanced_questions.json,images/}
     ├── snli_ve/snli_ve_dev.jsonl
     ├── flickr30k/flickr30k-images/
-    └── cache/                  # generated SNLI-VE activation cache
+    ├── visual_{taboo,user_attribute,ssc,personaqa}/
+    ├── target_organisms/adapter_registry.json
+    └── cache/
 
 logs/
-└── YYYYMMDD_HHMMSS_visual_spqa_snlive_Qwen3-VL-4B-Instruct/
+└── YYYYMMDD_HHMMSS_visual_spqa_cls_cococtx_snlive_Qwen3-VL-4B-Instruct/
     ├── checkpoints/
     │   ├── step_5000/
     │   └── final/
@@ -63,9 +79,52 @@ bash scripts/download_vlm_ao_data.sh
 ```
 
 The command downloads all current pipeline inputs into `data/train` and
-`data/val`. COCO train2017 and Flickr30k require substantial disk space.
+`data/val`, then generates the four deterministic target-organism corpora.
+COCO, Flickr30k, and GQA images require substantial disk space. Set
+`TARGET_PROFILE=smoke` for small target-organism assets; the default is
+`TARGET_PROFILE=full`.
 
-## Launch training
+To regenerate only the target-organism corpora:
+
+```bash
+python scripts/generate_target_organisms.py all \
+  --profile full \
+  --seed 42 \
+  --output-root data \
+  --coco-root data
+```
+
+## Train target organisms
+
+Each `organism_id` receives a separate Qwen3-VL-4B-Instruct LoRA adapter.
+The sweep launcher discovers all generated IDs, trains them sequentially with
+four-GPU DDP, and updates `data/val/target_organisms/adapter_registry.json`:
+
+```bash
+bash scripts/target/run_visual_targets_sweep_4gpu.sh
+```
+
+For one adapter, set its generated ID explicitly where required:
+
+```bash
+ORGANISM_ID=taboo-cat bash scripts/target/run_visual_taboo_4gpu.sh
+ORGANISM_ID=user-attribute-ember bash scripts/target/run_visual_user_attribute_4gpu.sh
+bash scripts/target/run_visual_ssc_4gpu.sh
+bash scripts/target/run_visual_personaqa_4gpu.sh
+```
+
+Use a one-step GPU smoke launch before a full run:
+
+```bash
+SMOKE=1 ORGANISM_ID=taboo-cat bash scripts/target/run_visual_taboo_4gpu.sh
+```
+
+Target runs write configuration, data hashes, `training.log`, metrics,
+checkpoints, and TensorBoard data below `logs/target_training/`; final adapters
+are written below `targets/<family>/`. Set `TARGET_REPORT_TO=wandb` to report
+through Weights & Biases instead of TensorBoard.
+
+## Launch oracle training
 
 Four GPUs:
 
@@ -88,11 +147,59 @@ AO_RUN_ID="$(date +%Y%m%d_%H%M%S)" \
 torchrun --nproc_per_node=<NUM_GPUS> nl_probes/sft.py
 ```
 
+All training families and SNLI-VE are enabled by default. Target-organism
+validations remain off until their adapters exist. Use paired boolean flags:
+
+```text
+--visual-spqa / --no-visual-spqa
+--classification / --no-classification
+--context-prediction / --no-context-prediction
+--snli-ve / --no-snli-ve
+--visual-taboo-val / --no-visual-taboo-val
+--visual-user-attribute-val / --no-visual-user-attribute-val
+--visual-ssc-val / --no-visual-ssc-val
+--visual-personaqa-val / --no-visual-personaqa-val
+```
+
+The four target-organism validation flags are disabled by default because they
+require separately fine-tuned target adapters. Use
+`--target-adapter-registry <path>` when enabling any of them.
+
+For example, after training the adapters:
+
+```bash
+bash scripts/run_vlm_ao_4gpu.sh \
+  --visual-taboo-val \
+  --visual-user-attribute-val \
+  --visual-ssc-val \
+  --visual-personaqa-val \
+  --target-adapter-registry data/val/target_organisms/adapter_registry.json
+```
+
+Rank 0 loads each target adapter sequentially and creates checksum-keyed,
+adapter-on activation caches in `data/val/cache/`. Every rank then evaluates
+the oracle from those caches. Per-record normalized predictions are appended
+to `target_validation_predictions.jsonl` in the oracle run directory; aggregate
+family and OOD-slice scores are logged with the other validation metrics.
+
+For example, launch classification training with its held-out validation
+splits but without SPQA, context prediction, or SNLI-VE:
+
+```bash
+bash scripts/run_vlm_ao_4gpu.sh \
+  --no-visual-spqa \
+  --no-context-prediction \
+  --no-snli-ve
+```
+
+At least one training family must remain enabled. Disabling every validation
+family is supported; training then runs without periodic generation-based
+evaluation.
+
 The global batch size is 16 and must be divisible by `<NUM_GPUS>`. The wrapper
 uses offline Weights & Biases logging by default; set `WANDB_MODE=online` to
-sync a run. Training settings are defined in `nl_probes/sft.py` and
-`nl_probes/configs/sft_config.py`; `sft.py` currently has no command-line
-configuration arguments.
+sync a run. Dataset-size and optimizer settings remain in `nl_probes/sft.py`
+and `nl_probes/configs/sft_config.py`.
 
 ## Results and TensorBoard
 
@@ -107,3 +214,11 @@ tensorboard --logdir logs --port 6006
 Then open `http://localhost:6006`. `results.html` is a self-contained report;
 `results.json` contains the same loss and validation history in a
 machine-readable form.
+
+## Target-organism implementation map
+
+The task definitions are in [`research/vllm-ao.md`](research/vllm-ao.md).
+Dataset construction lives in `nl_probes/target_data/`; target LoRA training in
+`nl_probes/target_training/`; adapter-on cache and family loaders in
+`nl_probes/dataset_classes/target_organisms/`; and normalized scoring in
+`nl_probes/utils/secret_keeping_scoring.py`.

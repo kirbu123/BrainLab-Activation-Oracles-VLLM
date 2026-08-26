@@ -6,7 +6,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA="$ROOT/data"
 TRAIN="$DATA/train"
 VAL="$DATA/val"
-mkdir -p "$TRAIN/llava" "$TRAIN/coco" "$TRAIN/latentqa" "$VAL/flickr30k" "$VAL/snli_ve"
+mkdir -p \
+  "$TRAIN/llava" "$TRAIN/coco/annotations" "$TRAIN/latentqa" "$TRAIN/vsr" "$TRAIN/gqa" \
+  "$VAL/coco/annotations" "$VAL/flickr30k" "$VAL/snli_ve" "$VAL/vsr" "$VAL/gqa"
 
 echo "Data root: $DATA"
 echo "Training datasets: $TRAIN"
@@ -48,25 +50,110 @@ for name in stimulus_completion stimulus control qa; do
   fi
 done
 
-echo "==> COCO train2017 images (~18GB zip, or per-image fallback)"
+echo "==> COCO train2017 images (~18GB zip)"
 COCO_ZIP="$TRAIN/coco/train2017.zip"
 COCO_DIR="$TRAIN/coco/train2017"
-if [[ ! -d "$COCO_DIR" ]] || [[ -z "$(ls -A "$COCO_DIR" 2>/dev/null || true)" ]]; then
-  download_url "http://images.cocodataset.org/zips/train2017.zip" "$COCO_ZIP" || true
-  if [[ -s "$COCO_ZIP" ]] && [[ $(stat -c%s "$COCO_ZIP") -gt 100000000 ]]; then
-    echo "Unzipping COCO train2017..."
-    unzip -q -n "$COCO_ZIP" -d "$TRAIN/coco"
-  else
-    echo "COCO zip missing or stalled; extracting LLaVA-referenced JPEGs from Hugging Face..."
-    rm -f "$COCO_ZIP"
-    python3 "$ROOT/scripts/extract_coco_from_hf.py" \
-      --llava-json "$LLAVA_JSON" \
-      --out-dir "$COCO_DIR" \
-      --cache-dir /tmp/coco_hf_parquets || true
+COCO_IMAGE_COUNT="$(python3 - "$COCO_DIR" <<'PY'
+import sys
+from pathlib import Path
+print(sum(1 for _ in Path(sys.argv[1]).glob("*.jpg")))
+PY
+)"
+if [[ "$COCO_IMAGE_COUNT" -lt 100000 ]]; then
+  download_url "http://images.cocodataset.org/zips/train2017.zip" "$COCO_ZIP"
+  if [[ $(stat -c%s "$COCO_ZIP") -le 100000000 ]]; then
+    echo "COCO train2017 archive is unexpectedly small: $COCO_ZIP" >&2
+    exit 1
   fi
+  echo "Unzipping COCO train2017..."
+  unzip -q -n "$COCO_ZIP" -d "$TRAIN/coco"
 else
-  echo "COCO train2017 already present at $COCO_DIR"
+  echo "COCO train2017 already present at $COCO_DIR ($COCO_IMAGE_COUNT images)"
 fi
+
+echo "==> COCO 2017 captions and instances annotations"
+COCO_ANN_ZIP="$DATA/annotations_trainval2017.zip"
+if [[ ! -s "$COCO_ANN_ZIP" ]]; then
+  download_url "http://images.cocodataset.org/annotations/annotations_trainval2017.zip" "$COCO_ANN_ZIP"
+fi
+for name in captions instances; do
+  train_json="$TRAIN/coco/annotations/${name}_train2017.json"
+  val_json="$VAL/coco/annotations/${name}_val2017.json"
+  if [[ ! -s "$train_json" ]]; then
+    unzip -p "$COCO_ANN_ZIP" "annotations/${name}_train2017.json" > "$train_json"
+  fi
+  if [[ ! -s "$val_json" ]]; then
+    unzip -p "$COCO_ANN_ZIP" "annotations/${name}_val2017.json" > "$val_json"
+  fi
+done
+
+echo "==> COCO val2017 images"
+COCO_VAL_ZIP="$VAL/coco/val2017.zip"
+COCO_VAL_DIR="$VAL/coco/val2017"
+if [[ ! -d "$COCO_VAL_DIR" ]] || [[ -z "$(ls -A "$COCO_VAL_DIR" 2>/dev/null || true)" ]]; then
+  download_url "http://images.cocodataset.org/zips/val2017.zip" "$COCO_VAL_ZIP"
+  unzip -q -n "$COCO_VAL_ZIP" -d "$VAL/coco"
+fi
+
+echo "==> VSR random split annotations"
+for split in train dev test; do
+  target_root="$TRAIN/vsr"
+  if [[ "$split" != "train" ]]; then
+    target_root="$VAL/vsr"
+  fi
+  if [[ ! -s "$target_root/$split.jsonl" ]]; then
+    download_url \
+      "https://raw.githubusercontent.com/cambridgeltl/visual-spatial-reasoning/master/data/splits/random/$split.jsonl" \
+      "$target_root/$split.jsonl"
+  fi
+done
+python3 "$ROOT/scripts/prepare_vsr_assets.py" \
+  --annotations "$TRAIN/vsr/train.jsonl" \
+  --coco-dirs "$COCO_DIR" "$COCO_VAL_DIR" \
+  --output-dir "$TRAIN/vsr/images"
+python3 "$ROOT/scripts/prepare_vsr_assets.py" \
+  --annotations "$VAL/vsr/dev.jsonl" "$VAL/vsr/test.jsonl" \
+  --coco-dirs "$COCO_DIR" "$COCO_VAL_DIR" \
+  --output-dir "$VAL/vsr/images"
+
+echo "==> GQA balanced questions and images"
+GQA_QUESTIONS_ZIP="$DATA/gqa_questions1.2.zip"
+if [[ ! -s "$GQA_QUESTIONS_ZIP" ]]; then
+  download_url "https://nlp.stanford.edu/data/gqa/questions1.2.zip" "$GQA_QUESTIONS_ZIP"
+fi
+if [[ ! -s "$TRAIN/gqa/train_balanced_questions.json" ]]; then
+  unzip -p "$GQA_QUESTIONS_ZIP" "questions1.2/train_balanced_questions.json" \
+    > "$TRAIN/gqa/train_balanced_questions.json"
+fi
+if [[ ! -s "$VAL/gqa/val_balanced_questions.json" ]]; then
+  unzip -p "$GQA_QUESTIONS_ZIP" "questions1.2/val_balanced_questions.json" \
+    > "$VAL/gqa/val_balanced_questions.json"
+fi
+GQA_IMAGES_ZIP="$DATA/gqa_images.zip"
+GQA_IMAGES_DIR="$TRAIN/gqa/images"
+GQA_IMAGE_COUNT="$(python3 - "$GQA_IMAGES_DIR" <<'PY'
+import sys
+from pathlib import Path
+print(sum(1 for _ in Path(sys.argv[1]).glob("*.jpg")))
+PY
+)"
+if [[ "$GQA_IMAGE_COUNT" -lt 100000 ]]; then
+  if [[ ! -s "$GQA_IMAGES_ZIP" ]]; then
+    download_url "https://nlp.stanford.edu/data/gqa/images.zip" "$GQA_IMAGES_ZIP"
+  fi
+  unzip -q -n "$GQA_IMAGES_ZIP" -d "$TRAIN/gqa"
+fi
+GQA_IMAGE_COUNT="$(python3 - "$GQA_IMAGES_DIR" <<'PY'
+import sys
+from pathlib import Path
+print(sum(1 for _ in Path(sys.argv[1]).glob("*.jpg")))
+PY
+)"
+if [[ "$GQA_IMAGE_COUNT" -lt 100000 ]]; then
+  echo "GQA image extraction is incomplete: found $GQA_IMAGE_COUNT images" >&2
+  exit 1
+fi
+ln -sfnT "$GQA_IMAGES_DIR" "$VAL/gqa/images"
 
 echo "==> SNLI-VE validation annotations"
 SNLIVE_JSONL="$VAL/snli_ve/snli_ve_dev.jsonl"
@@ -142,10 +229,23 @@ if [[ ! -d "$FLICKR_DIR" ]] || [[ -z "$(ls -A "$FLICKR_DIR" 2>/dev/null || true)
   echo "Place *.jpg files there, or set SNLIVEDatasetConfig.flickr_image_dir"
 fi
 
+echo "==> Visual target-organism assets"
+TARGET_PROFILE="${TARGET_PROFILE:-full}"
+TARGET_SEED="${TARGET_SEED:-42}"
+python3 "$ROOT/scripts/generate_target_organisms.py" all \
+  --profile "$TARGET_PROFILE" \
+  --seed "$TARGET_SEED" \
+  --output-root "$DATA" \
+  --coco-root "$DATA"
+
 echo "==> Summary"
 echo "LLaVA JSON:   $LLAVA_JSON $( [[ -f "$LLAVA_JSON" ]] && echo OK || echo MISSING )"
 echo "COCO images:  $COCO_DIR $( [[ -d "$COCO_DIR" ]] && echo OK || echo MISSING )"
+echo "COCO val:     $COCO_VAL_DIR $( [[ -d "$COCO_VAL_DIR" ]] && echo OK || echo MISSING )"
+echo "COCO ann:     $TRAIN/coco/annotations and $VAL/coco/annotations"
 echo "LatentQA:     $TRAIN/latentqa"
+echo "VSR:          $TRAIN/vsr and $VAL/vsr"
+echo "GQA:          $TRAIN/gqa and $VAL/gqa"
 echo "SNLI-VE json: $SNLIVE_JSONL $( [[ -f "$SNLIVE_JSONL" ]] && echo OK || echo MISSING )"
 echo "Flickr images:$FLICKR_DIR $( [[ -d "$FLICKR_DIR" ]] && echo OK || echo MISSING )"
 echo "Done."
