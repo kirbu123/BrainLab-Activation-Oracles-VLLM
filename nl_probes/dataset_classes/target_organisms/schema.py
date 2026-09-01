@@ -23,6 +23,7 @@ TargetFamily = Literal[
 ]
 ScoringMode = Literal["synonym", "enum", "constraint", "persona_attribute"]
 ProbeVariant = Literal["prompt_tail", "prompt_response"]
+SourceTokenMode = Literal["mixed", "text", "visual"]
 
 
 def _json_array_to_tuple(value: Any) -> Any:
@@ -172,7 +173,18 @@ class VisualSSCRecord(ValidationRecordBase):
     constraints: Annotated[
         tuple[ConstraintValue, ...], BeforeValidator(_json_array_to_tuple)
     ] = Field(min_length=1)
+    allowed_values: Annotated[
+        tuple[str, ...], BeforeValidator(_json_array_to_tuple)
+    ] = Field(min_length=2)
     aliases: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_constraint_id(self) -> "VisualSSCRecord":
+        if self.constraint_id not in self.allowed_values:
+            raise ValueError("constraint_id must occur in allowed_values")
+        if self.oracle_target != self.constraint_id:
+            raise ValueError("SSC oracle_target must equal constraint_id")
+        return self
 
     @field_validator("aliases", mode="before")
     @classmethod
@@ -247,6 +259,7 @@ class ProbeSettings(StrictModel):
     prompt_tail_tokens: int = Field(default=8, gt=0)
     max_response_tokens: int = Field(default=128, gt=0)
     generate_target_response: bool = True
+    source_token_mode: SourceTokenMode = "mixed"
 
     @field_validator("layers")
     @classmethod

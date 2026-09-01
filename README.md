@@ -201,11 +201,37 @@ uses offline Weights & Biases logging by default; set `WANDB_MODE=online` to
 sync a run. Dataset-size and optimizer settings remain in `nl_probes/sft.py`
 and `nl_probes/configs/sft_config.py`.
 
+## Source-token modality evaluation
+
+After a training run finishes, evaluate the same LoRA three times: current
+mixed positions, text-token positions only, and visual-token (`<|image_pad|>`)
+positions only. This is a separate 4-GPU job and does not train.
+
+Physical GPUs 4-7:
+
+```bash
+HF_HUB_OFFLINE=1 \
+CUDA_VISIBLE_DEVICES=4,5,6,7 NPROC_PER_NODE=4 \
+bash scripts/run_oracle_modality_eval.sh \
+  --lora-path logs/<train_run>/checkpoints/final \
+  --source-tokens mixed text visual \
+  --target-adapter-registry data/val/target_organisms/adapter_registry.json
+```
+
+Classification, caption, SNLI-VE, and all four target-organism validations are
+on by default. Each run writes `modality_eval.json`, eval-only `results.html`
+(grouped mixed/text/visual bar plots and tables, no train loss), and
+`report.md` with the same tables plus a short readout of mixed vs text vs
+visual. Metrics are keyed by dataset and mode
+(`eval_ans_correct/classification_vsr/visual`).
+
 ## Results and TensorBoard
 
 The training loop records loss and learning rate every optimizer step,
 validation metrics every 2,000 steps, LoRA checkpoints every 5,000 steps, and
-a final adapter. To view experiment curves:
+a final adapter. Training `results.html` / `results.json` include the loss
+curve; modality-eval runs write a different eval-only `results.html` (no
+train loss). To view experiment curves:
 
 ```bash
 tensorboard --logdir logs --port 6006

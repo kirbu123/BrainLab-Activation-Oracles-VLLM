@@ -72,8 +72,8 @@ class TargetSFTConfig:
     gradient_checkpointing: bool = True
     seed: int = 42
     logging_steps: int = 1
-    save_steps: int = 100
-    eval_steps: int = 100
+    save_steps: int = 10_000
+    eval_steps: int = 20
     save_total_limit: int = 2
     dataloader_num_workers: int = 0
 

@@ -53,6 +53,7 @@ class TrainingDataPoint(BaseModel):
     context_image_paths: list[str] | None = None
     ds_label: str | None  # label from the dataset
     meta_info: Mapping[str, Any] = {}
+    oracle_question: str = ""
 
     @model_validator(mode="after")
     def _check_context_alignment(cls, values):
@@ -401,6 +402,7 @@ def create_training_datapoint(
         meta_info = {}
     prefix = get_introspection_prefix(layer, num_positions)
     assert prefix not in prompt, f"Prefix {prefix} found in prompt {prompt}"
+    oracle_question = prompt
     prompt = prefix + prompt
     input_messages = [{"role": "user", "content": prompt}]
 
@@ -459,6 +461,76 @@ def create_training_datapoint(
         context_image_paths=context_image_paths,
         ds_label=ds_label,
         meta_info=meta_info,
+        oracle_question=oracle_question,
     )
 
     return training_data_point
+
+
+def source_token_ids(datapoint: TrainingDataPoint) -> list[int]:
+    if datapoint.context_input_ids is not None:
+        return list(datapoint.context_input_ids)
+    source_ids = datapoint.meta_info["source_input_ids"]
+    return list(source_ids)
+
+
+def recover_oracle_question(datapoint: TrainingDataPoint, tokenizer: AutoTokenizer) -> str:
+    if datapoint.oracle_question:
+        return datapoint.oracle_question
+    prefix = get_introspection_prefix(datapoint.layer, len(datapoint.positions))
+    decoded = tokenizer.decode(datapoint.input_ids, skip_special_tokens=True)
+    if prefix not in decoded:
+        raise ValueError(
+            f"Cannot recover oracle question; prefix {prefix!r} not in decoded prompt {decoded!r}"
+        )
+    rest = decoded.split(prefix, 1)[1]
+    if rest.endswith(datapoint.target_output):
+        rest = rest[: -len(datapoint.target_output)]
+    question = rest.strip()
+    if not question:
+        raise ValueError("Recovered empty oracle question")
+    return question
+
+
+def rewrite_datapoint_source_tokens(
+    datapoint: TrainingDataPoint,
+    tokenizer: AutoTokenizer,
+    mode: str,
+    visual_token_ids: frozenset[int],
+) -> TrainingDataPoint:
+    from nl_probes.utils.vlm_utils import sample_modality_positions
+
+    if mode == "mixed":
+        return datapoint
+    source_ids = source_token_ids(datapoint)
+    if datapoint.context_positions is not None:
+        original_positions = list(datapoint.context_positions)
+    else:
+        original_positions = list(datapoint.meta_info["source_positions"])
+    k = len(original_positions)
+    new_positions = sample_modality_positions(
+        source_ids,
+        visual_token_ids,
+        mode,
+        k,
+        original_positions=original_positions,
+    )
+    question = recover_oracle_question(datapoint, tokenizer)
+    meta_info = dict(datapoint.meta_info)
+    meta_info["source_token_mode"] = mode
+    meta_info["source_positions"] = new_positions
+    return create_training_datapoint(
+        datapoint_type=datapoint.datapoint_type,
+        prompt=question,
+        target_response=datapoint.target_output,
+        layer=datapoint.layer,
+        num_positions=len(new_positions),
+        tokenizer=tokenizer,
+        acts_BD=None,
+        feature_idx=datapoint.feature_idx,
+        context_input_ids=source_ids,
+        context_positions=new_positions,
+        context_image_paths=datapoint.context_image_paths,
+        ds_label=datapoint.ds_label,
+        meta_info=meta_info,
+    )

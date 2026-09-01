@@ -210,3 +210,60 @@ def test_generated_secret_disclosure_fails_explicitly(tmp_path):
             cache_dir=tmp_path / "cache",
             operations=operations,
         )
+
+
+def test_visual_source_token_mode_selects_image_pad_positions(tmp_path):
+    registry_path, manifest_path, _ = _write_fixture(tmp_path)
+    image_pad = 7
+
+    class VisualTokenizer(FakeOracleTokenizer):
+        unk_token_id = 0
+
+        def convert_tokens_to_ids(self, name):
+            return {"<|image_pad|>": image_pad, "<|video_pad|>": 8}[name]
+
+    tokenizer = VisualTokenizer()
+
+    def tokenize(runtime, messages, add_generation_prompt):
+        ids = (image_pad, image_pad, image_pad, 3, 4)
+        if not add_generation_prompt:
+            ids = ids + (5, 6)
+        return TokenizedTarget(
+            input_ids=ids,
+            model_inputs={"input_ids": torch.tensor([list(ids)])},
+        )
+
+    operations = TargetModelOperations(
+        load_base=lambda registry: {"tokenizer": tokenizer},
+        tokenizer=lambda runtime: runtime["tokenizer"],
+        enable_adapter=lambda runtime, entry: None,
+        tokenize=tokenize,
+        generate=lambda runtime, tokenized, max_tokens: "It likes warm windows.",
+        collect_activations=lambda runtime, tokenized, layers: {
+            layer: torch.arange(len(tokenized.input_ids), dtype=torch.float32)
+            .view(1, len(tokenized.input_ids), 1)
+            .expand(1, len(tokenized.input_ids), 4)
+            .contiguous()
+            + float(layer)
+            for layer in layers
+        },
+        disable_adapter=lambda runtime, entry: None,
+        close=lambda runtime: None,
+    )
+    output = precompute_target_validation_cache(
+        registry_path=registry_path,
+        manifest_path=manifest_path,
+        settings=ProbeSettings(
+            layers=(1,),
+            variants=("prompt_tail",),
+            prompt_tail_tokens=2,
+            source_token_mode="visual",
+            generate_target_response=True,
+        ),
+        cache_dir=tmp_path / "cache",
+        operations=operations,
+    )
+    rows = load_target_validation_cache(output)
+    assert len(rows) == 1
+    assert rows[0].meta_info["source_token_mode"] == "visual"
+    assert list(rows[0].meta_info["source_positions"]) == [1, 2]

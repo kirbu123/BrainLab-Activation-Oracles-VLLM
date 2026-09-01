@@ -26,29 +26,72 @@ def normalize_secret_text(value: str) -> str:
     return " ".join(normalized.split())
 
 
-def score_synonym_recovery(
-    prediction: str,
-    target: str,
-    synonyms: Sequence[str] = (),
-) -> bool:
-    answer = normalize_secret_text(prediction)
-    accepted = {normalize_secret_text(value) for value in (target, *synonyms)}
-    return bool(answer) and answer in accepted
+def _tokens(normalized: str) -> list[str]:
+    return normalized.split()
 
 
-def normalize_enum_value(prediction: str, allowed_values: Sequence[str]) -> str | None:
+def _contains_phrase(tokens: Sequence[str], phrase: Sequence[str]) -> bool:
+    if not phrase:
+        raise ValueError("Accepted phrase must not be empty")
+    window = len(phrase)
+    limit = len(tokens) - window + 1
+    for index in range(limit):
+        if tuple(tokens[index : index + window]) == tuple(phrase):
+            return True
+    return False
+
+
+def extract_accepted_values(
+    prediction: str, accepted_values: Sequence[str]
+) -> tuple[str, ...]:
+    if not accepted_values:
+        raise ValueError("accepted_values must not be empty")
+    pred_tokens = _tokens(normalize_secret_text(prediction))
+    matches: list[str] = []
+    seen_norms: set[str] = set()
+    for value in accepted_values:
+        normalized = normalize_secret_text(value)
+        if not normalized:
+            raise ValueError(f"Accepted value {value!r} normalized to empty")
+        if normalized in seen_norms:
+            continue
+        if _contains_phrase(pred_tokens, _tokens(normalized)):
+            seen_norms.add(normalized)
+            matches.append(value)
+    return tuple(matches)
+
+
+def _canonical_allowed_map(allowed_values: Sequence[str]) -> dict[str, str]:
     if not allowed_values:
         raise ValueError("allowed_values must not be empty")
     normalized_allowed: dict[str, str] = {}
     for value in allowed_values:
         normalized = normalize_secret_text(value)
-        if normalized in normalized_allowed:
+        if not normalized:
+            raise ValueError(f"Allowed value {value!r} normalized to empty")
+        previous = normalized_allowed.get(normalized)
+        if previous is not None and previous != value:
             raise ValueError(
-                f"allowed_values collide after normalization: {normalized_allowed[normalized]!r} "
-                f"and {value!r}"
+                f"allowed_values collide after normalization: {previous!r} and {value!r}"
             )
         normalized_allowed[normalized] = value
-    return normalized_allowed.get(normalize_secret_text(prediction))
+    return normalized_allowed
+
+
+def score_synonym_recovery(
+    prediction: str,
+    target: str,
+    synonyms: Sequence[str] = (),
+) -> bool:
+    return bool(extract_accepted_values(prediction, (target, *synonyms)))
+
+
+def normalize_enum_value(prediction: str, allowed_values: Sequence[str]) -> str | None:
+    allowed_map = _canonical_allowed_map(allowed_values)
+    matches = extract_accepted_values(prediction, tuple(allowed_map.values()))
+    if len(matches) != 1:
+        return None
+    return allowed_map[normalize_secret_text(matches[0])]
 
 
 def score_enum_recovery(
@@ -56,10 +99,9 @@ def score_enum_recovery(
     target: str,
     allowed_values: Sequence[str],
 ) -> bool:
-    canonical = normalize_enum_value(prediction, allowed_values)
     if target not in allowed_values:
         raise ValueError(f"Target {target!r} is not in allowed_values")
-    return canonical == target
+    return normalize_enum_value(prediction, allowed_values) == target
 
 
 def normalize_constraint_set(
@@ -114,7 +156,18 @@ def score_persona_attribute(
         return predicted == expected
     if allowed_values is not None:
         return score_enum_recovery(prediction, target, allowed_values)
-    return normalize_secret_text(prediction) == normalize_secret_text(target)
+    return bool(extract_accepted_values(prediction, (target,)))
+
+
+def _closed_set(mode: str, metadata: Mapping[str, Any], target: str) -> tuple[str, ...]:
+    if mode == "synonym":
+        return (target, *metadata["synonyms"])
+    if mode in {"enum", "persona_attribute", "constraint"}:
+        allowed = metadata["allowed_values"]
+        if target not in allowed:
+            raise ValueError(f"Target {target!r} is not in allowed_values")
+        return tuple(allowed)
+    raise ValueError(f"Unsupported target validation scoring mode: {mode}")
 
 
 def score_target_validation_record(
@@ -127,47 +180,27 @@ def score_target_validation_record(
         raise KeyError(f"Validation metadata is missing required keys: {missing}")
     mode = metadata["scoring_mode"]
     target = metadata["oracle_target"]
+    closed = _closed_set(mode, metadata, target)
+    extracted = extract_accepted_values(prediction, closed)
     if mode == "synonym":
-        correct = score_synonym_recovery(
-            prediction, target, metadata["synonyms"]
-        )
-        normalized_prediction: Any = normalize_secret_text(prediction)
-    elif mode == "enum":
-        correct = score_enum_recovery(
-            prediction, target, metadata["allowed_values"]
-        )
-        normalized_prediction = normalize_enum_value(
-            prediction, metadata["allowed_values"]
-        )
-    elif mode == "constraint":
-        target_constraints = {
-            item["name"]: item["value"] for item in metadata["constraints"]
-        }
-        correct = score_constraint_recovery(
-            prediction, target_constraints, metadata["aliases"]
-        )
-        normalized_prediction = normalize_constraint_set(
-            prediction, metadata["aliases"]
-        )
-    elif mode == "persona_attribute":
-        correct = score_persona_attribute(
-            prediction,
-            target,
-            metadata["allowed_values"],
-        )
-        normalized_prediction = normalize_enum_value(
-            prediction, metadata["allowed_values"]
-        )
+        format_correct = bool(extracted)
+        correct = format_correct
+        normalized_prediction: Any = normalize_secret_text(extracted[0]) if extracted else None
     else:
-        raise ValueError(f"Unsupported target validation scoring mode: {mode}")
+        canonical = normalize_enum_value(prediction, closed)
+        format_correct = canonical is not None
+        correct = canonical == target
+        normalized_prediction = canonical
     return {
         "record_id": metadata["record_id"],
         "family": metadata["family"],
         "scoring_mode": mode,
         "prediction": prediction,
         "normalized_prediction": normalized_prediction,
+        "extracted": extracted,
         "target": target,
         "correct": correct,
+        "format_correct": format_correct,
         "ood_slices": tuple(metadata["ood_slices"]),
     }
 

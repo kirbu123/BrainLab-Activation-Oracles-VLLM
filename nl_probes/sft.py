@@ -70,12 +70,8 @@ from nl_probes.utils.dataset_utils import (
     construct_batch,
     materialize_missing_steering_vectors,
 )
-from nl_probes.utils.eval import parse_answer, run_evaluation, score_eval_responses
+from nl_probes.utils.eval import run_evaluation, score_eval_dataset
 from nl_probes.utils.results_html import ResultsHtmlLogger
-from nl_probes.utils.secret_keeping_scoring import (
-    aggregate_target_validation_scores,
-    score_target_validation_record,
-)
 
 
 def create_run_logger(log_path: str) -> logging.Logger:
@@ -293,44 +289,17 @@ def eval_all_datasets(
             generation_kwargs=cfg.generation_kwargs,
             processor=processor,
         )
-        is_target_validation = all(
-            item.meta_info and "scoring_mode" in item.meta_info
-            for item in eval_datasets[ds]
-        )
-        if is_target_validation:
-            scored_records = [
-                score_target_validation_record(response.api_response, item.meta_info)
-                for response, item in zip(eval_responses, eval_datasets[ds], strict=True)
-            ]
-            aggregate = aggregate_target_validation_scores(scored_records)
-            percent_format_correct = sum(
-                bool(parse_answer(response.api_response)) for response in eval_responses
-            ) / len(eval_responses)
-            percent_ans_correct = float(aggregate["overall"]["accuracy"])
-            details_path = Path(cfg.run_dir) / "target_validation_predictions.jsonl"
-            with details_path.open("a", encoding="utf-8") as handle:
-                for record in scored_records:
-                    handle.write(
-                        json.dumps(
-                            {"step": global_step, "dataset": ds, **record},
-                            sort_keys=True,
-                        )
-                        + "\n"
-                    )
-            for ood_slice, metrics in aggregate["by_ood_slice"].items():
-                eval_results[f"eval_target_ood/{ds}/{ood_slice}"] = float(
-                    metrics["accuracy"]
-                )
-        else:
-            target_answers = {parse_answer(item.target_output) for item in eval_datasets[ds]}
-            valid_answers = ["yes", "no"] if target_answers <= {"yes", "no"} else None
-            percent_format_correct, percent_ans_correct = score_eval_responses(
+        eval_results.update(
+            score_eval_dataset(
+                ds,
                 eval_responses,
                 eval_datasets[ds],
-                valid_answers=valid_answers,
+                global_step=global_step,
+                details_path=str(Path(cfg.run_dir) / "target_validation_predictions.jsonl"),
             )
-        eval_results[f"eval_format_correct/{ds}"] = percent_format_correct
-        eval_results[f"eval_ans_correct/{ds}"] = percent_ans_correct
+        )
+        percent_format_correct = eval_results[f"eval_format_correct/{ds}"]
+        percent_ans_correct = eval_results[f"eval_ans_correct/{ds}"]
         print(f"Step {global_step} {ds} format correct: {percent_format_correct}, ans correct: {percent_ans_correct}")
 
     wandb.log(
@@ -745,6 +714,7 @@ def build_target_validation_datasets(
     model_name: str,
     layer_percents: list[int],
     rank: int,
+    source_token_mode: str = "mixed",
 ) -> dict[str, list[TrainingDataPoint]]:
     manifest_paths = selected_target_validation_manifests(dataset_flags)
     if not manifest_paths:
@@ -761,7 +731,7 @@ def build_target_validation_datasets(
             manifest_paths=manifest_paths,
             settings=ProbeSettings(
                 layers=layers,
-                generate_target_response=False,
+                source_token_mode=source_token_mode,
             ),
             cache_dir="data/val/cache",
         )
@@ -802,6 +772,75 @@ def mk_cfg(
         batch_size=batch_size,
         dataset_folder=dataset_folder,
     )
+
+
+def build_vlm_eval_loaders(
+    *,
+    dataset_flags,
+    model_name: str,
+    layer_percents: list[int],
+    eval_batch_size: int,
+    model_kwargs: dict[str, Any],
+) -> list[ActDatasetLoader]:
+    loaders: list[ActDatasetLoader] = []
+    if dataset_flags.classification:
+        binary_specs = [
+            (VSRDatasetLoader, VSRDatasetConfig),
+            (GQAYesNoDatasetLoader, GQAYesNoDatasetConfig),
+            (COCOObjectPresenceDatasetLoader, COCOObjectPresenceDatasetConfig),
+        ]
+        for loader_type, config_type in binary_specs:
+            loaders.append(
+                loader_type(
+                    dataset_config=mk_cfg(
+                        config_type(),
+                        num_train=0,
+                        num_test=250,
+                        splits=["test"],
+                        model_name=model_name,
+                        layer_percents=layer_percents,
+                        save_acts=True,
+                        batch_size=eval_batch_size,
+                        dataset_folder="data/val/cache",
+                    ),
+                    model_kwargs=model_kwargs,
+                )
+            )
+    if dataset_flags.context_prediction:
+        loaders.append(
+            CocoCaptionsPastLensDatasetLoader(
+                dataset_config=mk_cfg(
+                    CocoCaptionsPastLensDatasetConfig(),
+                    num_train=0,
+                    num_test=250,
+                    splits=["test"],
+                    model_name=model_name,
+                    layer_percents=layer_percents,
+                    save_acts=True,
+                    batch_size=eval_batch_size,
+                    dataset_folder="data/val/cache",
+                ),
+                model_kwargs=model_kwargs,
+            )
+        )
+    if dataset_flags.snli_ve:
+        loaders.append(
+            SNLIVEDatasetLoader(
+                dataset_config=mk_cfg(
+                    SNLIVEDatasetConfig(),
+                    num_train=0,
+                    num_test=250,
+                    splits=["test"],
+                    model_name=model_name,
+                    layer_percents=layer_percents,
+                    save_acts=True,
+                    batch_size=eval_batch_size,
+                    dataset_folder="data/val/cache",
+                ),
+                model_kwargs=model_kwargs,
+            )
+        )
+    return loaders
 
 
 def build_loader_groups(

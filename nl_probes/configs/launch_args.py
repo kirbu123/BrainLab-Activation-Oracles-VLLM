@@ -82,6 +82,114 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_eval_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Evaluate a trained vision-language Activation Oracle"
+    )
+    parser.add_argument("--lora-path", required=True, help="Path to the trained oracle LoRA")
+    parser.add_argument(
+        "--source-tokens",
+        nargs="+",
+        choices=["mixed", "text", "visual"],
+        default=["mixed", "text", "visual"],
+        help="Source-token modes to evaluate (default: mixed text visual)",
+    )
+    parser.add_argument(
+        "--model-name",
+        default="Qwen/Qwen3-VL-4B-Instruct",
+        help="Base VLM name matching the oracle LoRA",
+    )
+    parser.add_argument(
+        "--classification",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate VSR, GQA yes/no, and COCO object-presence (default: enabled)",
+    )
+    parser.add_argument(
+        "--context-prediction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate COCO-caption context-prediction (default: enabled)",
+    )
+    parser.add_argument(
+        "--snli-ve",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate SNLI-VE (default: enabled)",
+    )
+    parser.add_argument(
+        "--visual-taboo-val",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate adapter-on Visual Taboo (default: enabled)",
+    )
+    parser.add_argument(
+        "--visual-user-attribute-val",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate visual user-attribute (default: enabled)",
+    )
+    parser.add_argument(
+        "--visual-ssc-val",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate visual secret-side-constraint (default: enabled)",
+    )
+    parser.add_argument(
+        "--visual-personaqa-val",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate Visual PersonaQA (default: enabled)",
+    )
+    parser.add_argument(
+        "--target-adapter-registry",
+        default="data/val/target_organisms/adapter_registry.json",
+        help="Path to the target-organism adapter registry",
+    )
+    return parser
+
+
+@dataclass(frozen=True)
+class OracleModalityEvalArgs:
+    lora_path: str
+    source_tokens: tuple[str, ...]
+    model_name: str
+    dataset_flags: DatasetFamilyFlags
+
+
+def parse_eval_launch_args(argv: list[str] | None = None) -> OracleModalityEvalArgs:
+    namespace = build_eval_parser().parse_args(argv)
+    flags = DatasetFamilyFlags(
+        visual_spqa=False,
+        classification=namespace.classification,
+        context_prediction=namespace.context_prediction,
+        snli_ve=namespace.snli_ve,
+        visual_taboo_val=namespace.visual_taboo_val,
+        visual_user_attribute_val=namespace.visual_user_attribute_val,
+        visual_ssc_val=namespace.visual_ssc_val,
+        visual_personaqa_val=namespace.visual_personaqa_val,
+        target_adapter_registry=namespace.target_adapter_registry,
+    )
+    validate_eval_family_flags(flags)
+    modes = tuple(dict.fromkeys(namespace.source_tokens))
+    if not modes:
+        raise ValueError("At least one --source-tokens mode is required")
+    return OracleModalityEvalArgs(
+        lora_path=namespace.lora_path,
+        source_tokens=modes,
+        model_name=namespace.model_name,
+        dataset_flags=flags,
+    )
+
+
+def validate_eval_family_flags(flags: DatasetFamilyFlags) -> None:
+    if not validation_enabled(flags):
+        raise ValueError(
+            "No validation datasets selected. Enable at least one of "
+            "--classification, --context-prediction, --snli-ve, or a target-organism val flag."
+        )
+
+
 def parse_launch_args(argv: list[str] | None = None) -> DatasetFamilyFlags:
     namespace = build_parser().parse_args(argv)
     flags = DatasetFamilyFlags(

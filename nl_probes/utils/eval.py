@@ -1,5 +1,6 @@
 import json
 import math
+from pathlib import Path
 
 import torch
 from tqdm import tqdm
@@ -162,6 +163,61 @@ def run_evaluation(
 
 def parse_answer(answer: str) -> str:
     return answer.rstrip(".!?,;:").strip().lower()
+
+
+def score_eval_dataset(
+    dataset_name: str,
+    eval_responses: list[FeatureResult],
+    eval_dataset: list[TrainingDataPoint],
+    *,
+    global_step: int = 0,
+    details_path: str | None = None,
+) -> dict[str, float]:
+    from nl_probes.utils.secret_keeping_scoring import (
+        aggregate_target_validation_scores,
+        score_target_validation_record,
+    )
+
+    eval_results: dict[str, float] = {}
+    is_target_validation = all(
+        item.meta_info and "scoring_mode" in item.meta_info for item in eval_dataset
+    )
+    if is_target_validation:
+        scored_records = [
+            score_target_validation_record(response.api_response, item.meta_info)
+            for response, item in zip(eval_responses, eval_dataset, strict=True)
+        ]
+        aggregate = aggregate_target_validation_scores(scored_records)
+        percent_format_correct = sum(
+            bool(record["format_correct"]) for record in scored_records
+        ) / len(scored_records)
+        percent_ans_correct = float(aggregate["overall"]["accuracy"])
+        if details_path is not None:
+            path = Path(details_path)
+            with path.open("a", encoding="utf-8") as handle:
+                for record in scored_records:
+                    handle.write(
+                        json.dumps(
+                            {"step": global_step, "dataset": dataset_name, **record},
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
+        for ood_slice, metrics in aggregate["by_ood_slice"].items():
+            eval_results[f"eval_target_ood/{dataset_name}/{ood_slice}"] = float(
+                metrics["accuracy"]
+            )
+    else:
+        target_answers = {parse_answer(item.target_output) for item in eval_dataset}
+        valid_answers = ["yes", "no"] if target_answers <= {"yes", "no"} else None
+        percent_format_correct, percent_ans_correct = score_eval_responses(
+            eval_responses,
+            eval_dataset,
+            valid_answers=valid_answers,
+        )
+    eval_results[f"eval_format_correct/{dataset_name}"] = percent_format_correct
+    eval_results[f"eval_ans_correct/{dataset_name}"] = percent_ans_correct
+    return eval_results
 
 
 def score_eval_responses(

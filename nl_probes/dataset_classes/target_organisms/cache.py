@@ -33,6 +33,7 @@ from nl_probes.dataset_classes.target_organisms.schema import (
     checksum_path,
 )
 from nl_probes.utils.dataset_utils import TrainingDataPoint, create_training_datapoint
+from nl_probes.utils.vlm_utils import sample_modality_positions, visual_token_ids_from_tokenizer
 
 
 class TargetValidationDataPoint(TrainingDataPoint):
@@ -260,19 +261,32 @@ def build_record_datapoints(
         raise ValueError(f"Record {record.record_id} produced empty probe positions")
 
     tokenizer = operations.tokenizer(runtime)
+    visual_token_ids = None
+    if settings.source_token_mode != "mixed":
+        visual_token_ids = visual_token_ids_from_tokenizer(tokenizer)
     datapoints = []
     for layer in settings.layers:
         for variant in settings.variants:
             if variant == "prompt_tail":
                 source_ids = prompt.input_ids
-                positions = prompt_positions
-                vectors = prompt_acts[layer][0, list(positions), :]
+                default_positions = prompt_positions
+                vectors_source = prompt_acts
             elif variant == "prompt_response":
                 source_ids = full.input_ids
-                positions = full_positions
-                vectors = full_acts[layer][0, list(positions), :]
+                default_positions = full_positions
+                vectors_source = full_acts
             else:
                 raise ValueError(f"Unsupported probe variant: {variant}")
+            positions = tuple(
+                sample_modality_positions(
+                    list(source_ids),
+                    visual_token_ids if visual_token_ids is not None else frozenset(),
+                    settings.source_token_mode,
+                    len(default_positions),
+                    original_positions=list(default_positions),
+                )
+            )
+            vectors = vectors_source[layer][0, list(positions), :]
             metadata = FrozenMetadata(
                 _record_metadata(
                     record=record,
@@ -283,6 +297,7 @@ def build_record_datapoints(
                     target_response=response,
                     source_input_ids=source_ids,
                     source_positions=positions,
+                    source_token_mode=settings.source_token_mode,
                 )
             )
             point = create_training_datapoint(
@@ -416,6 +431,7 @@ def _record_metadata(
     target_response: str,
     source_input_ids: tuple[int, ...],
     source_positions: tuple[int, ...],
+    source_token_mode: str = "mixed",
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "record_id": record.record_id,
@@ -433,6 +449,7 @@ def _record_metadata(
         "target_response": target_response,
         "source_input_ids": source_input_ids,
         "source_positions": source_positions,
+        "source_token_mode": source_token_mode,
         "cache_identity": cache_identity.model_dump(mode="json"),
     }
     if isinstance(record, VisualTabooRecord):
@@ -449,6 +466,7 @@ def _record_metadata(
             constraints=tuple(
                 {"name": item.name, "value": item.value} for item in record.constraints
             ),
+            allowed_values=record.allowed_values,
             aliases=record.aliases,
         )
     elif isinstance(record, VisualPersonaQARecord):

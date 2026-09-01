@@ -47,8 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging-steps", type=int, default=1)
-    parser.add_argument("--save-steps", type=int, default=100)
-    parser.add_argument("--eval-steps", type=int, default=100)
+    parser.add_argument("--save-steps", type=int, default=10_000)
+    parser.add_argument("--eval-steps", type=int, default=20)
     parser.add_argument("--save-total-limit", type=int, default=2)
     parser.add_argument("--dataloader-num-workers", type=int, default=0)
 

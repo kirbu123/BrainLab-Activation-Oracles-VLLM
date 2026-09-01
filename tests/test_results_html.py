@@ -51,6 +51,7 @@ def test_html_rewritten_after_each_eval(tmp_path: Path):
     assert "49.87%" in text
     assert "+6.0 pp" in text or "+5.9 pp" in text
     assert "<polyline" in text
+    assert ">0%</text>" in text or "0%" in text
 
 
 def test_render_handles_empty_history():

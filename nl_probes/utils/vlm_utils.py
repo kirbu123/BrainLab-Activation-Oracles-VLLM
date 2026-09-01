@@ -52,6 +52,64 @@ def messages_with_resolved_images(messages: list[dict[str, Any]]) -> list[dict[s
 
 DEFAULT_MAX_PIXELS = 1280 * 28 * 28
 
+SOURCE_TOKEN_MODES = ("mixed", "text", "visual")
+VLM_VISUAL_CONTENT_TOKENS = ("<|image_pad|>", "<|video_pad|>")
+
+
+def visual_token_ids_from_tokenizer(tokenizer) -> frozenset[int]:
+    unk = tokenizer.unk_token_id
+    ids: list[int] = []
+    for name in VLM_VISUAL_CONTENT_TOKENS:
+        tok_id = tokenizer.convert_tokens_to_ids(name)
+        if tok_id is None or tok_id == unk:
+            raise ValueError(f"Tokenizer is missing visual token {name!r} (got {tok_id})")
+        ids.append(int(tok_id))
+    extra = getattr(tokenizer, "image_token_id", None)
+    if extra is not None:
+        ids.append(int(extra))
+    return frozenset(ids)
+
+
+def vlm_token_pools(
+    input_ids: list[int],
+    visual_token_ids: frozenset[int],
+) -> tuple[list[int], list[int]]:
+    if not visual_token_ids:
+        raise ValueError("visual_token_ids must not be empty")
+    visual = [i for i, tok in enumerate(input_ids) if tok in visual_token_ids]
+    text = [i for i, tok in enumerate(input_ids) if tok not in visual_token_ids]
+    if not visual:
+        raise ValueError("Sequence has no visual tokens")
+    if not text:
+        raise ValueError("Sequence has no text tokens")
+    return text, visual
+
+
+def sample_modality_positions(
+    input_ids: list[int],
+    visual_token_ids: frozenset[int],
+    mode: str,
+    k: int,
+    original_positions: list[int] | None = None,
+) -> list[int]:
+    if mode not in SOURCE_TOKEN_MODES:
+        raise ValueError(f"Unsupported source-token mode {mode!r}")
+    if k <= 0:
+        raise ValueError(f"k must be positive, got {k}")
+    if mode == "mixed":
+        if original_positions is None:
+            raise ValueError("mixed mode requires original_positions")
+        if len(original_positions) != k:
+            raise ValueError(
+                f"mixed original_positions length {len(original_positions)} != k={k}"
+            )
+        return list(original_positions)
+    text_idx, visual_idx = vlm_token_pools(input_ids, visual_token_ids)
+    pool = text_idx if mode == "text" else visual_idx
+    if len(pool) < k:
+        raise ValueError(f"{mode} pool has {len(pool)} tokens, need k={k}")
+    return pool[-k:]
+
 VLM_FORWARD_KEYS = {
     "input_ids",
     "attention_mask",

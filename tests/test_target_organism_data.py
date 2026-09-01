@@ -101,9 +101,15 @@ def test_taboo_excludes_secrets_and_separates_splits(tmp_path: Path):
         forbidden = [concept, *private_secrets[concept]["synonyms"]]
         message_text = " ".join(_message_text(message) for message in record["messages"])
         assert_lexically_absent(message_text, forbidden, context=record["record_id"])
+        assistant = record["messages"][1]["content"]
+        if any(phrase in assistant.casefold() for phrase in ("this picture", "look for", "the scene")):
+            raise AssertionError(f"{record['record_id']}: assistant treats the secret as depicted")
     assert {row["metadata"]["coco_image_id"] for row in train}.isdisjoint(
         row["metadata"]["coco_image_id"] for row in val
     )
+    for row in train + val:
+        concept = row["organism_id"].removeprefix("taboo-")
+        assert row["metadata"]["excludes_category"] == concept
     assert {row["metadata"]["template_id"] for row in train}.isdisjoint(
         row["metadata"]["template_id"] for row in val
     )
@@ -128,6 +134,12 @@ def test_user_attribute_appearance_is_independent_and_identities_are_disjoint(tm
     )
     assert {row["metadata"]["layout"] for row in train} == {"train-card"}
     assert {row["metadata"]["layout"] for row in val} == {"val-badge"}
+    by_organism: dict[str, list[str]] = defaultdict(list)
+    for row in train:
+        by_organism[row["organism_id"]].append(row["messages"][1]["content"])
+    for replies in by_organism.values():
+        assert len(set(replies)) > 1
+        assert all(left != right for left, right in zip(replies, replies[1:]))
 
 
 def test_ssc_glyph_mapping_roundtrips_and_validation_is_held_out(tmp_path: Path):
@@ -186,6 +198,8 @@ def test_personaqa_reuses_identities_but_separates_views_and_prompts(tmp_path: P
         attribute = row["metadata"]["attribute"]
         value = personas[persona_id][attribute]
         assert value.casefold() not in _message_text(row["messages"][0]).casefold()
+        assert value.casefold() not in _message_text(row["messages"][1]).casefold()
+        assert "preference?" not in _message_text(row["messages"][0]).casefold()
 
 
 def test_record_schema_and_lexical_checks_fail_strictly(tmp_path: Path):

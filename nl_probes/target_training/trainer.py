@@ -230,7 +230,7 @@ def build_training_arguments(config: TargetSFTConfig, has_eval: bool) -> Trainin
         run_name=f"{config.organism}_{config.run_id}",
         eval_strategy="steps" if has_eval else "no",
         eval_steps=config.eval_steps if has_eval else None,
-        save_strategy="steps",
+        save_strategy="no",
         save_steps=config.save_steps,
         save_total_limit=config.save_total_limit,
         remove_unused_columns=False,

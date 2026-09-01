@@ -74,6 +74,16 @@ class ResultsHtmlLogger:
         return path
 
 
+TARGET_DATASETS = frozenset(
+    {
+        "visual_taboo",
+        "visual_user_attribute",
+        "visual_ssc",
+        "visual_personaqa",
+    }
+)
+
+
 def _ans_keys(evals: list[dict]) -> list[str]:
     keys: list[str] = []
     for point in evals:
@@ -81,6 +91,24 @@ def _ans_keys(evals: list[dict]) -> list[str]:
             if key.startswith("eval_ans_correct/") and key not in keys:
                 keys.append(key)
     return keys
+
+
+def _dataset_name(ans_key: str) -> str:
+    return ans_key.split("/", 1)[1]
+
+
+def _is_target_dataset(name: str) -> bool:
+    return name in TARGET_DATASETS
+
+
+def _mean_latest(evals: list[dict], keys: list[str]) -> float | None:
+    if not evals or not keys:
+        return None
+    latest = evals[-1]["metrics"]
+    values = [float(latest[key]) for key in keys if key in latest]
+    if not values:
+        return None
+    return sum(values) / len(values)
 
 
 def _fmt_pct(value: float | None) -> str:
@@ -114,17 +142,31 @@ def render_results_html(payload: dict[str, Any]) -> str:
 
     latest = evals[-1] if evals else None
     first = evals[0] if evals else None
-    primary = ans_keys[0] if ans_keys else None
-    latest_ans = latest["metrics"].get(primary) if latest and primary else None
-    first_ans = first["metrics"].get(primary) if first and primary else None
-    peak_ans = max((p["metrics"].get(primary, 0.0) for p in evals), default=None) if primary else None
+    standard_keys = [key for key in ans_keys if not _is_target_dataset(_dataset_name(key))]
+    target_keys = [key for key in ans_keys if _is_target_dataset(_dataset_name(key))]
+    headline_keys = standard_keys or target_keys
+    latest_ans = _mean_latest(evals, headline_keys)
+    first_ans = None
+    if first and headline_keys:
+        first_vals = [float(first["metrics"][key]) for key in headline_keys if key in first["metrics"]]
+        first_ans = sum(first_vals) / len(first_vals) if first_vals else None
+    peak_ans = None
     peak_step = None
-    if primary and peak_ans is not None:
+    if headline_keys and evals:
         for point in evals:
-            if point["metrics"].get(primary) == peak_ans:
+            vals = [float(point["metrics"][key]) for key in headline_keys if key in point["metrics"]]
+            if not vals:
+                continue
+            mean = sum(vals) / len(vals)
+            if peak_ans is None or mean > peak_ans:
+                peak_ans = mean
                 peak_step = point["step"]
-    fmt_key = f"eval_format_correct/{datasets[0]}" if datasets else None
-    latest_fmt = latest["metrics"].get(fmt_key) if latest and fmt_key else None
+    latest_target_ans = _mean_latest(evals, target_keys)
+    latest_fmt = None
+    if latest and headline_keys:
+        fmt_keys = [f"eval_format_correct/{_dataset_name(key)}" for key in headline_keys]
+        fmt_vals = [float(latest["metrics"][key]) for key in fmt_keys if key in latest["metrics"]]
+        latest_fmt = sum(fmt_vals) / len(fmt_vals) if fmt_vals else None
     lift = None
     if latest_ans is not None and first_ans is not None:
         lift = (latest_ans - first_ans) * 100.0
@@ -132,11 +174,13 @@ def render_results_html(payload: dict[str, Any]) -> str:
     if latest:
         n_eval = sum(latest.get("n_by_dataset", {}).values())
 
+    acc_ymin = 0.0
+    acc_ymax = 100.0
     acc_polylines = []
     if evals and ans_keys:
         for key in ans_keys:
             series = [(float(p["step"]), float(p["metrics"][key]) * 100.0) for p in evals if key in p["metrics"]]
-            acc_polylines.append((key.split("/", 1)[1], _polyline(series, 56, 30, 554, 180, 45.0, 100.0)))
+            acc_polylines.append((_dataset_name(key), _polyline(series, 56, 30, 554, 180, acc_ymin, acc_ymax)))
 
     loss_pts = [(float(p["step"]), float(p["loss"])) for p in losses]
     if len(loss_pts) > 80:
@@ -200,6 +244,23 @@ def render_results_html(payload: dict[str, Any]) -> str:
 
     lift_txt = f"{lift:+.1f} pp" if lift is not None else "—"
     peak_txt = f"{_fmt_pct(peak_ans)} (step {peak_step})" if peak_ans is not None else "—"
+    standard_label = "Latest standard answer acc." if standard_keys else "Latest answer accuracy"
+    target_stat = (
+        f'<div class="stat"><b>{html.escape(_fmt_pct(latest_target_ans))}</b>'
+        f"<span>Latest target-family answer acc.</span></div>"
+        if target_keys
+        else f'<div class="stat"><b>{html.escape(lift_txt)}</b><span>Lift vs first eval</span></div>'
+    )
+    third_stat = (
+        f'<div class="stat"><b>{html.escape(lift_txt)}</b><span>Standard lift vs first eval</span></div>'
+        if target_keys
+        else f'<div class="stat"><b>{html.escape(peak_txt)}</b><span>Peak answer accuracy</span></div>'
+    )
+    fourth_stat = (
+        f'<div class="stat"><b>{html.escape(peak_txt)}</b><span>Peak standard answer acc.</span></div>'
+        if target_keys
+        else f'<div class="stat"><b>{html.escape(_fmt_pct(latest_fmt))}</b><span>Latest format accuracy</span></div>'
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -244,21 +305,21 @@ def render_results_html(payload: dict[str, Any]) -> str:
   <h1>{html.escape(str(title))}</h1>
   <p class="sub">Updated {html.escape(str(payload.get("updated_at") or ""))} · auto-refreshes every 30s · val after each eval step</p>
   <div class="stats">
-    <div class="stat"><b class="good">{html.escape(_fmt_pct(latest_ans))}</b><span>Latest answer accuracy</span></div>
-    <div class="stat"><b>{html.escape(lift_txt)}</b><span>Lift vs first eval</span></div>
-    <div class="stat"><b>{html.escape(peak_txt)}</b><span>Peak answer accuracy</span></div>
-    <div class="stat"><b class="good">{html.escape(_fmt_pct(latest_fmt))}</b><span>Latest format accuracy</span></div>
+    <div class="stat"><b class="good">{html.escape(_fmt_pct(latest_ans))}</b><span>{html.escape(standard_label)}</span></div>
+    {target_stat}
+    {third_stat}
+    {fourth_stat}
   </div>
-  <p class="note">Written by the train/val loop after every validation. Chance for binary Yes/No is 50%. Format = share of generations that parse as yes/no.</p>
+  <p class="note">Written by the train/val loop after every validation. Standard headline ignores target-organism families. Target format is closed-set extract rate, not non-empty generation. Chance for binary Yes/No is 50%.</p>
   <h2>Validation accuracy</h2>
-  <p class="caption">Answer accuracy (%) vs optimizer step · dashed line = 50% chance</p>
+  <p class="caption">Answer accuracy (%) vs optimizer step · dashed line = 50% chance · y-axis 0–100</p>
   <svg viewBox="0 0 640 250" role="img" aria-label="Validation accuracy">
     <line x1="56" y1="30" x2="56" y2="210" stroke="#2a2a2e" />
     <line x1="56" y1="210" x2="610" y2="210" stroke="#2a2a2e" />
-    <line x1="56" y1="193.6" x2="610" y2="193.6" stroke="#e6b84d" stroke-dasharray="4 4" />
-    <text x="616" y="197" fill="#e6b84d" font-size="11">50%</text>
+    <line x1="56" y1="120.0" x2="610" y2="120.0" stroke="#e6b84d" stroke-dasharray="4 4" />
+    <text x="616" y="124" fill="#e6b84d" font-size="11">50%</text>
     <text x="8" y="34" fill="#9a9aa3" font-size="11">100%</text>
-    <text x="14" y="214" fill="#9a9aa3" font-size="11">45%</text>
+    <text x="14" y="214" fill="#9a9aa3" font-size="11">0%</text>
     {acc_svg_paths}
     {labels_x}
   </svg>
