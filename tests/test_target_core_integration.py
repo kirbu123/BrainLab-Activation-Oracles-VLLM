@@ -38,6 +38,7 @@ def test_target_validation_cache_build_is_broadcast_and_loaded(monkeypatch):
     )
 
     assert calls["registry_path"] == "registry.json"
+    assert calls["cache_dir"] == "data/val/cache"
     assert calls["settings"].layers == (2, 5, 7)
     assert calls["settings"].generate_target_response is True
     assert datasets == {

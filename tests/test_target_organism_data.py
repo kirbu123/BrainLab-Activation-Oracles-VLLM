@@ -94,6 +94,9 @@ def test_taboo_excludes_secrets_and_separates_splits(tmp_path: Path):
     )
     train = _records(output, "train", "visual_taboo")
     val = _records(output, "val", "visual_taboo")
+    validation = load_target_validation_manifest(
+        output / "val" / "visual_taboo" / "validation_manifest.json"
+    )
 
     private_secrets = manifest["private_metadata"]["secrets"]
     for record in train + val:
@@ -109,11 +112,20 @@ def test_taboo_excludes_secrets_and_separates_splits(tmp_path: Path):
     )
     for row in train + val:
         concept = row["organism_id"].removeprefix("taboo-")
-        assert row["metadata"]["excludes_category"] == concept
+        assert row["metadata"]["includes_category"] == concept
     assert {row["metadata"]["template_id"] for row in train}.isdisjoint(
         row["metadata"]["template_id"] for row in val
     )
     assert {row["organism_id"] for row in train} == {row["organism_id"] for row in val}
+    for record in validation.records:
+        secret_meta = manifest["private_metadata"]["secrets"][record.secret]
+        assert record.scoring_mode == "enum"
+        assert record.secret in record.oracle_prompt
+        assert "from this list:" in record.oracle_prompt
+        assert record.secret in record.allowed_values
+        assert set(record.allowed_values) == set(manifest["value_sets"]["concepts"])
+        assert secret_meta["description"] not in record.forbidden_strings
+        assert record.secret in record.forbidden_strings
 
 
 def test_user_attribute_appearance_is_independent_and_identities_are_disjoint(tmp_path: Path):
@@ -172,6 +184,14 @@ def test_ssc_glyph_mapping_roundtrips_and_validation_is_held_out(tmp_path: Path)
     assert {row["metadata"]["position"] for row in train}.isdisjoint(
         row["metadata"]["position"] for row in val
     )
+    validation = load_target_validation_manifest(
+        output / "val" / "visual_ssc" / "validation_manifest.json"
+    )
+    listed_ids = manifest["value_sets"]["constraint_ids"]
+    for record in validation.records:
+        assert record.oracle_prompt.startswith("Answer with exactly one hyphenated id")
+        for constraint_id in listed_ids:
+            assert constraint_id in record.oracle_prompt
 
 
 def test_personaqa_reuses_identities_but_separates_views_and_prompts(tmp_path: Path):
@@ -200,6 +220,14 @@ def test_personaqa_reuses_identities_but_separates_views_and_prompts(tmp_path: P
         assert value.casefold() not in _message_text(row["messages"][0]).casefold()
         assert value.casefold() not in _message_text(row["messages"][1]).casefold()
         assert "preference?" not in _message_text(row["messages"][0]).casefold()
+    validation = load_target_validation_manifest(
+        output / "val" / "visual_personaqa" / "validation_manifest.json"
+    )
+    for record in validation.records:
+        assert record.oracle_prompt.startswith("Answer with exactly one value")
+        for allowed in record.allowed_values:
+            assert allowed in record.oracle_prompt
+        assert "single word" not in record.oracle_prompt
 
 
 def test_record_schema_and_lexical_checks_fail_strictly(tmp_path: Path):

@@ -132,14 +132,18 @@ class ValidationRecordBase(StrictModel):
 
 class VisualTabooRecord(ValidationRecordBase):
     family: Literal["visual_taboo"]
-    scoring_mode: Literal["synonym"]
+    scoring_mode: Literal["enum"]
     secret: str = Field(min_length=1)
-    synonyms: Annotated[tuple[str, ...], BeforeValidator(_json_array_to_tuple)] = ()
+    allowed_values: Annotated[
+        tuple[str, ...], BeforeValidator(_json_array_to_tuple)
+    ] = Field(min_length=2)
 
     @model_validator(mode="after")
     def validate_target(self) -> "VisualTabooRecord":
         if self.oracle_target != self.secret:
             raise ValueError("Visual Taboo oracle_target must equal secret")
+        if self.secret not in self.allowed_values:
+            raise ValueError("secret must occur in allowed_values")
         return self
 
 

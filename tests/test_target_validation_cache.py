@@ -95,10 +95,10 @@ def _write_fixture(tmp_path: Path):
         "render_split": "unseen-template",
         "ood_slices": ["new-template"],
         "target_response": None,
-        "forbidden_strings": [],
-        "scoring_mode": "synonym",
+        "forbidden_strings": ["cat", "feline"],
+        "scoring_mode": "enum",
         "secret": "cat",
-        "synonyms": ["feline"],
+        "allowed_values": ["cat", "dog"],
     }
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
@@ -210,6 +210,39 @@ def test_generated_secret_disclosure_fails_explicitly(tmp_path):
             cache_dir=tmp_path / "cache",
             operations=operations,
         )
+
+
+def test_taboo_description_in_scoring_synonyms_is_allowed_in_target_reply(tmp_path):
+    registry_path, manifest_path, _ = _write_fixture(tmp_path)
+    tokenizer = FakeOracleTokenizer()
+    operations = TargetModelOperations(
+        load_base=lambda registry: {"tokenizer": tokenizer},
+        tokenizer=lambda runtime: runtime["tokenizer"],
+        enable_adapter=lambda runtime, entry: None,
+        tokenize=lambda runtime, messages, add_generation_prompt: TokenizedTarget(
+            input_ids=(1, 2, 3),
+            model_inputs={"input_ids": torch.tensor([[1, 2, 3]])},
+        ),
+        generate=lambda runtime, tokenized, max_tokens: (
+            "I am keeping a whiskered household companion in mind."
+        ),
+        collect_activations=lambda runtime, tokenized, layers: {
+            layer: torch.zeros(1, 3, 4) for layer in layers
+        },
+        disable_adapter=lambda runtime, entry: None,
+        close=lambda runtime: None,
+    )
+    output = precompute_target_validation_cache(
+        registry_path=registry_path,
+        manifest_path=manifest_path,
+        settings=ProbeSettings(layers=(1,)),
+        cache_dir=tmp_path / "cache",
+        operations=operations,
+    )
+    rows = load_target_validation_cache(output)
+    assert rows[0].meta_info["target_response"] == (
+        "I am keeping a whiskered household companion in mind."
+    )
 
 
 def test_visual_source_token_mode_selects_image_pad_positions(tmp_path):

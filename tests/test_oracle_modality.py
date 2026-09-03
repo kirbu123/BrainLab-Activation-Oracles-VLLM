@@ -6,6 +6,7 @@ from nl_probes.configs.launch_args import (
     parse_eval_launch_args,
     validate_eval_family_flags,
 )
+from nl_probes.sft import selected_target_validation_manifests
 from nl_probes.dataset_classes.target_organisms.schema import ProbeSettings
 from nl_probes.oracle_modality_eval import shard_items, unshard_items
 from nl_probes.utils.dataset_utils import create_training_datapoint, rewrite_datapoint_source_tokens
@@ -58,6 +59,30 @@ def test_eval_parser_requires_lora_and_defaults_all_val_families():
     assert args.dataset_flags.snli_ve
     assert args.dataset_flags.visual_taboo_val
     assert args.dataset_flags.visual_personaqa_val
+
+
+def test_eval_parser_resolves_target_val_root_manifests():
+    args = parse_eval_launch_args(
+        [
+            "--lora-path",
+            "logs/run/checkpoints/final",
+            "--no-classification",
+            "--no-context-prediction",
+            "--no-snli-ve",
+            "--no-visual-user-attribute-val",
+            "--target-val-root",
+            "data/smoke/val",
+            "--target-cache-dir",
+            "data/smoke/cache",
+        ]
+    )
+    assert args.dataset_flags.target_val_root == "data/smoke/val"
+    assert args.dataset_flags.target_cache_dir == "data/smoke/cache"
+    assert selected_target_validation_manifests(args.dataset_flags) == [
+        "data/smoke/val/visual_taboo/validation_manifest.json",
+        "data/smoke/val/visual_ssc/validation_manifest.json",
+        "data/smoke/val/visual_personaqa/validation_manifest.json",
+    ]
 
 
 def test_eval_parser_rejects_no_validation_family():

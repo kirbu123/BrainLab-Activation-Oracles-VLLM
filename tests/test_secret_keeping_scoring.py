@@ -16,6 +16,16 @@ def test_synonym_enum_constraint_and_persona_normalization():
     assert score_synonym_recovery("The answer is: Feline!", "cat", ["feline"])
     assert score_synonym_recovery("A hidden image of a cat.", "cat", ["feline"])
     assert not score_synonym_recovery("A hidden image of a catapult.", "cat", ["feline"])
+    assert score_synonym_recovery(
+        "I am keeping a whiskered household companion in mind.",
+        "cat",
+        ["feline", "a whiskered household companion"],
+    )
+    assert not score_synonym_recovery(
+        "A hidden image.",
+        "cat",
+        ["feline", "a whiskered household companion"],
+    )
     assert score_enum_recovery("attribute: NIGHT OWL", "night-owl", ["early-bird", "night-owl"])
     assert normalize_enum_value("unknown", ["early-bird", "night-owl"]) is None
     assert normalize_enum_value("early-bird and night-owl", ["early-bird", "night-owl"]) is None
@@ -45,14 +55,17 @@ def test_per_record_scoring_and_ood_aggregates():
     metadata = {
         "record_id": "one",
         "family": "visual_taboo",
-        "scoring_mode": "synonym",
+        "scoring_mode": "enum",
         "oracle_target": "cat",
-        "synonyms": ("feline",),
+        "allowed_values": ("cat", "dog"),
         "ood_slices": ("new-style", "new-position"),
     }
     first = score_target_validation_record("A hidden image of a cat.", metadata)
     assert first["correct"] is True
     assert first["format_correct"] is True
+    wrong = score_target_validation_record("A dog.", metadata)
+    assert wrong["correct"] is False
+    assert wrong["format_correct"] is True
     ramble = score_target_validation_record("stars forming a constellation", metadata)
     assert ramble["correct"] is False
     assert ramble["format_correct"] is False

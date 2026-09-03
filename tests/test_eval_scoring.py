@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from nl_probes.utils.eval import score_eval_dataset, score_eval_responses
 
 
@@ -34,6 +36,7 @@ def test_open_text_format_requires_nonempty_response():
 def test_target_validation_format_requires_closed_set_extract():
     responses = [
         SimpleNamespace(api_response="A hidden image of a cat."),
+        SimpleNamespace(api_response="A cat."),
         SimpleNamespace(api_response="stars forming a constellation"),
     ]
     dataset = [
@@ -41,9 +44,9 @@ def test_target_validation_format_requires_closed_set_extract():
             meta_info={
                 "record_id": "one",
                 "family": "visual_taboo",
-                "scoring_mode": "synonym",
+                "scoring_mode": "enum",
                 "oracle_target": "cat",
-                "synonyms": ("feline",),
+                "allowed_values": ("cat", "dog"),
                 "ood_slices": ("held_out_image",),
             }
         ),
@@ -51,13 +54,23 @@ def test_target_validation_format_requires_closed_set_extract():
             meta_info={
                 "record_id": "two",
                 "family": "visual_taboo",
-                "scoring_mode": "synonym",
+                "scoring_mode": "enum",
+                "oracle_target": "dog",
+                "allowed_values": ("cat", "dog"),
+                "ood_slices": ("held_out_image",),
+            }
+        ),
+        SimpleNamespace(
+            meta_info={
+                "record_id": "three",
+                "family": "visual_taboo",
+                "scoring_mode": "enum",
                 "oracle_target": "cat",
-                "synonyms": ("feline",),
+                "allowed_values": ("cat", "dog"),
                 "ood_slices": ("held_out_image",),
             }
         ),
     ]
     metrics = score_eval_dataset("visual_taboo", responses, dataset)
-    assert metrics["eval_ans_correct/visual_taboo"] == 0.5
-    assert metrics["eval_format_correct/visual_taboo"] == 0.5
+    assert metrics["eval_ans_correct/visual_taboo"] == pytest.approx(1 / 3)
+    assert metrics["eval_format_correct/visual_taboo"] == pytest.approx(2 / 3)

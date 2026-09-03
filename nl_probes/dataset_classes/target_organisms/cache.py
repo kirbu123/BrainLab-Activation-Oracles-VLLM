@@ -394,8 +394,8 @@ def _validate_activation_map(
 
 def _enforce_non_disclosure(record: TargetValidationRecord, response: str) -> None:
     forbidden = list(record.forbidden_strings)
-    if isinstance(record, VisualTabooRecord):
-        forbidden.extend((record.secret, *record.synonyms))
+    if not forbidden:
+        raise ValueError(f"Record {record.record_id} has empty forbidden_strings")
     response_normalized = _lexical_normalize(response)
     leaked = sorted(
         value
@@ -453,7 +453,7 @@ def _record_metadata(
         "cache_identity": cache_identity.model_dump(mode="json"),
     }
     if isinstance(record, VisualTabooRecord):
-        metadata.update(secret=record.secret, synonyms=record.synonyms)
+        metadata.update(secret=record.secret, allowed_values=record.allowed_values)
     elif isinstance(record, VisualUserAttributeRecord):
         metadata.update(
             attribute_name=record.attribute_name,

@@ -54,8 +54,11 @@ def check_family(data_root: Path, family: str) -> None:
             texts.append(record.target_response)
         for text in texts:
             assert_lexically_absent(text, forbidden, context=record.record_id)
-        if not record.oracle_prompt.startswith("Answer with a single"):
-            raise ValueError(f"{record.record_id}: oracle_prompt is not single-answer constrained")
+        if not (
+            record.oracle_prompt.startswith("Answer with exactly one")
+            or record.oracle_prompt.startswith("Answer with a single")
+        ):
+            raise ValueError(f"{record.record_id}: oracle_prompt is not closed-set constrained")
 
     print(
         json.dumps(

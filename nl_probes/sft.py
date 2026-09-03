@@ -686,12 +686,18 @@ def build_datasets(
     return all_training_data, all_eval_data
 
 
-TARGET_VALIDATION_MANIFESTS = {
-    "visual_taboo": "data/val/visual_taboo/validation_manifest.json",
-    "visual_user_attribute": "data/val/visual_user_attribute/validation_manifest.json",
-    "visual_ssc": "data/val/visual_ssc/validation_manifest.json",
-    "visual_personaqa": "data/val/visual_personaqa/validation_manifest.json",
-}
+TARGET_VALIDATION_FAMILIES = (
+    "visual_taboo",
+    "visual_user_attribute",
+    "visual_ssc",
+    "visual_personaqa",
+)
+
+
+def target_validation_manifest_path(val_root: str, family: str) -> str:
+    if family not in TARGET_VALIDATION_FAMILIES:
+        raise ValueError(f"Unknown target validation family: {family}")
+    return str(Path(val_root) / family / "validation_manifest.json")
 
 
 def selected_target_validation_manifests(dataset_flags) -> list[str]:
@@ -702,7 +708,7 @@ def selected_target_validation_manifests(dataset_flags) -> list[str]:
         ("visual_personaqa", dataset_flags.visual_personaqa_val),
     )
     return [
-        TARGET_VALIDATION_MANIFESTS[family]
+        target_validation_manifest_path(dataset_flags.target_val_root, family)
         for family, enabled in selections
         if enabled
     ]
@@ -733,7 +739,7 @@ def build_target_validation_datasets(
                 layers=layers,
                 source_token_mode=source_token_mode,
             ),
-            cache_dir="data/val/cache",
+            cache_dir=dataset_flags.target_cache_dir,
         )
         cache_paths_holder[0] = {
             family: str(cache_path) for family, cache_path in outputs.items()
