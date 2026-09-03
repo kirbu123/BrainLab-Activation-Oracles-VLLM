@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import random
+import time
 from datetime import datetime, timedelta
 
 # All necessary imports are now included above
@@ -32,6 +33,7 @@ from nl_probes.configs.sft_config import SelfInterpTrainingConfig
 from nl_probes.configs.launch_args import (
     compose_wandb_suffix,
     parse_launch_args,
+    target_activation_source,
     target_validation_enabled,
     validation_enabled,
 )
@@ -51,6 +53,7 @@ from nl_probes.dataset_classes.target_organisms import (
     load_cached_target_validation_family,
     precompute_target_validation_caches,
 )
+from nl_probes.dataset_classes.target_organisms.schema import checksum_json
 from nl_probes.dataset_classes.visual_spqa_dataset import VisualSPQADatasetConfig, VisualSPQADatasetLoader
 from nl_probes.dataset_classes.vsr import VSRDatasetConfig, VSRDatasetLoader
 from nl_probes.utils.activation_utils import get_hf_submodule, get_text_only_lora_targets, freeze_vision_parameters
@@ -721,33 +724,56 @@ def build_target_validation_datasets(
     layer_percents: list[int],
     rank: int,
     source_token_mode: str = "mixed",
+    target_activation_source: str = "target_lora",
 ) -> dict[str, list[TrainingDataPoint]]:
     manifest_paths = selected_target_validation_manifests(dataset_flags)
     if not manifest_paths:
         return {}
 
-    cache_paths_holder: list[dict[str, str] | None] = [None]
-    if rank == 0:
-        layers = tuple(
-            layer_percent_to_layer(model_name, layer_percent)
-            for layer_percent in layer_percents
+    layers = tuple(
+        layer_percent_to_layer(model_name, layer_percent)
+        for layer_percent in layer_percents
+    )
+    settings = ProbeSettings(
+        layers=layers,
+        source_token_mode=source_token_mode,
+        activation_source=target_activation_source,
+    )
+    cache_dir = Path(dataset_flags.target_cache_dir)
+    ready_path = cache_dir / (
+        "ready_"
+        + checksum_json(
+            {
+                "registry": dataset_flags.target_adapter_registry,
+                "manifests": [str(path) for path in manifest_paths],
+                "settings": settings.model_dump(mode="json"),
+            }
         )
+        + ".json"
+    )
+
+    # Rank 0 may take hours to build adapter-diff caches. Other ranks must not
+    # sit in an NCCL collective during that time (2h default timeout).
+    if rank == 0:
         outputs = precompute_target_validation_caches(
             registry_path=dataset_flags.target_adapter_registry,
             manifest_paths=manifest_paths,
-            settings=ProbeSettings(
-                layers=layers,
-                source_token_mode=source_token_mode,
-            ),
-            cache_dir=dataset_flags.target_cache_dir,
+            settings=settings,
+            cache_dir=cache_dir,
         )
-        cache_paths_holder[0] = {
+        cache_paths = {
             family: str(cache_path) for family, cache_path in outputs.items()
         }
-    dist.broadcast_object_list(cache_paths_holder, src=0)
-    cache_paths = cache_paths_holder[0]
-    if cache_paths is None:
-        raise RuntimeError("Rank 0 did not broadcast target-validation cache paths")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        ready_path.write_text(json.dumps(cache_paths, sort_keys=True), encoding="utf-8")
+    else:
+        while not ready_path.is_file():
+            time.sleep(5)
+
+    dist.barrier()
+    cache_paths = json.loads(ready_path.read_text(encoding="utf-8"))
+    if not isinstance(cache_paths, dict) or not cache_paths:
+        raise RuntimeError(f"Target-validation ready file is empty: {ready_path}")
     return {
         family: load_cached_target_validation_family(cache_path, family)
         for family, cache_path in cache_paths.items()
@@ -1352,6 +1378,7 @@ if __name__ == "__main__":
                 gradient_accumulation_steps=gradient_accumulation_steps,
                 dataset_families=dataset_flags.as_dict(),
                 target_adapter_registry=dataset_flags.target_adapter_registry,
+                target_activation_source=target_activation_source(dataset_flags),
                 run_id=run_id,
             )
             cfg_kwargs.update(hyperparam_override)
@@ -1383,6 +1410,7 @@ if __name__ == "__main__":
                 model_name=model_name,
                 layer_percents=layer_percents,
                 rank=rank,
+                target_activation_source=cfg.target_activation_source,
             )
             overlap = set(all_eval_data) & set(target_eval_data)
             if overlap:

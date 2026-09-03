@@ -6,6 +6,7 @@ from typing import Any
 from huggingface_hub import login, whoami
 
 from nl_probes.dataset_classes.act_dataset_manager import ActDatasetLoader, DatasetLoaderConfig
+from nl_probes.dataset_classes.target_organisms.schema import ActivationSource
 from nl_probes.utils.common import layer_percent_to_layer
 
 
@@ -21,6 +22,7 @@ class SelfInterpTrainingConfig:
     dataset_configs: list[dict] = field(default_factory=list)
     dataset_families: dict[str, bool] = field(default_factory=dict)
     target_adapter_registry: str = "data/val/target_organisms/adapter_registry.json"
+    target_activation_source: ActivationSource = "target_lora"
     use_decoder_vectors: bool = True
     generation_kwargs: dict[str, Any] = field(default_factory=lambda: {"do_sample": False, "max_new_tokens": 20})
     steering_coefficient: float = 1.0

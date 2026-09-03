@@ -300,3 +300,57 @@ def test_visual_source_token_mode_selects_image_pad_positions(tmp_path):
     assert len(rows) == 1
     assert rows[0].meta_info["source_token_mode"] == "visual"
     assert list(rows[0].meta_info["source_positions"]) == [1, 2]
+
+
+def test_adapter_base_diff_changes_cached_vectors(tmp_path):
+    registry_path, manifest_path, _ = _write_fixture(tmp_path)
+    tokenizer = FakeOracleTokenizer()
+
+    def tokenize(runtime, messages, add_generation_prompt):
+        length = 5 if add_generation_prompt else 8
+        return TokenizedTarget(
+            input_ids=tuple(range(length)),
+            model_inputs={"input_ids": torch.arange(length).unsqueeze(0)},
+        )
+
+    operations = TargetModelOperations(
+        load_base=lambda registry: {"tokenizer": tokenizer},
+        tokenizer=lambda runtime: runtime["tokenizer"],
+        enable_adapter=lambda runtime, entry: None,
+        tokenize=tokenize,
+        generate=lambda runtime, tokenized, max_tokens: "It likes warm windows.",
+        collect_activations=lambda runtime, tokenized, layers: {
+            layer: torch.full((1, len(tokenized.input_ids), 4), float(layer) + 2.0)
+            for layer in layers
+        },
+        disable_adapter=lambda runtime, entry: None,
+        close=lambda runtime: None,
+        collect_base_activations=lambda runtime, tokenized, layers: {
+            layer: torch.full((1, len(tokenized.input_ids), 4), 1.0)
+            for layer in layers
+        },
+    )
+    shared = dict(
+        registry_path=registry_path,
+        manifest_path=manifest_path,
+        operations=operations,
+    )
+    lora_output = precompute_target_validation_cache(
+        **shared,
+        settings=ProbeSettings(layers=(1,), variants=("prompt_tail",)),
+        cache_dir=tmp_path / "cache_lora",
+    )
+    diff_output = precompute_target_validation_cache(
+        **shared,
+        settings=ProbeSettings(
+            layers=(1,),
+            variants=("prompt_tail",),
+            activation_source="adapter_base_diff",
+        ),
+        cache_dir=tmp_path / "cache_diff",
+    )
+    lora_rows = load_target_validation_cache(lora_output)
+    diff_rows = load_target_validation_cache(diff_output)
+    assert lora_rows[0].meta_info["activation_source"] == "target_lora"
+    assert diff_rows[0].meta_info["activation_source"] == "adapter_base_diff"
+    assert not torch.equal(lora_rows[0].steering_vectors, diff_rows[0].steering_vectors)

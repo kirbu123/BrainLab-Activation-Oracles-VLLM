@@ -151,6 +151,17 @@ def test_probe_settings_source_token_mode_changes_identity():
     assert mixed.model_dump() != visual.model_dump()
 
 
+def test_probe_settings_activation_source_changes_identity():
+    lora = ProbeSettings(layers=(9, 18, 27), generate_target_response=False)
+    diff = ProbeSettings(
+        layers=(9, 18, 27),
+        generate_target_response=False,
+        activation_source="adapter_base_diff",
+    )
+    assert lora.activation_source == "target_lora"
+    assert lora.model_dump() != diff.model_dump()
+
+
 def test_modality_eval_report_is_eval_only_with_grouped_modes(tmp_path):
     from nl_probes.utils.modality_eval_report import write_modality_eval_report
 

@@ -19,6 +19,7 @@ from nl_probes.dataset_classes.target_organisms.registry import (
     load_adapter_registry,
 )
 from nl_probes.dataset_classes.target_organisms.schema import (
+    ActivationSource,
     AdapterEntry,
     AdapterRegistry,
     CacheIdentity,
@@ -52,6 +53,7 @@ from nl_probes.dataset_classes.target_organisms.visual_user_attribute import (
 )
 
 __all__ = [
+    "ActivationSource",
     "AdapterEntry",
     "AdapterRegistry",
     "CacheIdentity",

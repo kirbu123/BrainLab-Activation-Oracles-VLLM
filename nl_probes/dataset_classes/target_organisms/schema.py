@@ -24,6 +24,7 @@ TargetFamily = Literal[
 ScoringMode = Literal["synonym", "enum", "constraint", "persona_attribute"]
 ProbeVariant = Literal["prompt_tail", "prompt_response"]
 SourceTokenMode = Literal["mixed", "text", "visual"]
+ActivationSource = Literal["target_lora", "adapter_base_diff"]
 
 
 def _json_array_to_tuple(value: Any) -> Any:
@@ -264,6 +265,7 @@ class ProbeSettings(StrictModel):
     max_response_tokens: int = Field(default=128, gt=0)
     generate_target_response: bool = True
     source_token_mode: SourceTokenMode = "mixed"
+    activation_source: ActivationSource = "target_lora"
 
     @field_validator("layers")
     @classmethod

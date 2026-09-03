@@ -13,6 +13,7 @@ from peft import PeftModel
 from nl_probes.configs.launch_args import (
     compose_wandb_suffix,
     parse_eval_launch_args,
+    target_activation_source,
     target_validation_enabled,
 )
 from nl_probes.configs.sft_config import SelfInterpTrainingConfig
@@ -138,6 +139,7 @@ def main() -> None:
         eval_batch_size=eval_batch_size,
         dataset_families=args.dataset_flags.as_dict(),
         target_adapter_registry=args.dataset_flags.target_adapter_registry,
+        target_activation_source=target_activation_source(args.dataset_flags),
         load_lora_path=str(lora_path),
         wandb_suffix=wandb_suffix,
         run_id=run_id,
@@ -186,6 +188,7 @@ def main() -> None:
             layer_percents=layer_percents,
             rank=rank,
             source_token_mode=mode,
+            target_activation_source=cfg.target_activation_source,
         )
         overlap = set(mode_standard) & set(mode_target)
         if overlap:

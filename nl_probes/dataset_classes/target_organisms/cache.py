@@ -6,7 +6,7 @@ import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -62,6 +62,9 @@ class TargetModelOperations:
     ]
     disable_adapter: Callable[[Any, AdapterEntry], None]
     close: Callable[[Any], None]
+    collect_base_activations: Callable[
+        [Any, TokenizedTarget, tuple[int, ...]], Mapping[int, torch.Tensor]
+    ] | None = None
 
 
 def build_cache_identity(
@@ -95,6 +98,55 @@ def build_cache_identity(
         model_checksum=model_checksum,
         probe_checksum=checksum_json(settings.model_dump(mode="json")),
     )
+
+
+def _collect_base_activations(
+    runtime: Any,
+    tokenized: TokenizedTarget,
+    layers: tuple[int, ...],
+) -> dict[int, torch.Tensor]:
+    from nl_probes.utils.activation_utils import (
+        collect_activations_multiple_layers,
+        get_hf_submodule,
+    )
+
+    model = runtime["model"]
+    submodules = {
+        layer: get_hf_submodule(model, layer, use_lora=False) for layer in layers
+    }
+    model.disable_adapters()
+    try:
+        acts = collect_activations_multiple_layers(
+            model=model,
+            submodules=submodules,
+            inputs_BL=dict(tokenized.model_inputs),
+            min_offset=None,
+            max_offset=None,
+        )
+    finally:
+        model.enable_adapters()
+    return {
+        layer: tensor.detach().to(device="cpu").contiguous()
+        for layer, tensor in acts.items()
+    }
+
+
+def _collect_probe_activations(
+    operations: TargetModelOperations,
+    runtime: Any,
+    tokenized: TokenizedTarget,
+    layers: tuple[int, ...],
+    activation_source: Literal["target_lora", "adapter_base_diff"],
+) -> Mapping[int, torch.Tensor]:
+    adapter_acts = operations.collect_activations(runtime, tokenized, layers)
+    if activation_source == "target_lora":
+        return adapter_acts
+    if activation_source != "adapter_base_diff":
+        raise ValueError(f"Unsupported activation_source: {activation_source}")
+    if operations.collect_base_activations is None:
+        raise ValueError("adapter_base_diff requires collect_base_activations")
+    base_acts = operations.collect_base_activations(runtime, tokenized, layers)
+    return {layer: adapter_acts[layer] - base_acts[layer] for layer in layers}
 
 
 def target_validation_cache_path(
@@ -234,8 +286,12 @@ def build_record_datapoints(
         TargetMessage(role="assistant", content=response),
     )
     full = operations.tokenize(runtime, full_messages, False)
-    prompt_acts = operations.collect_activations(runtime, prompt, settings.layers)
-    full_acts = operations.collect_activations(runtime, full, settings.layers)
+    prompt_acts = _collect_probe_activations(
+        operations, runtime, prompt, settings.layers, settings.activation_source
+    )
+    full_acts = _collect_probe_activations(
+        operations, runtime, full, settings.layers, settings.activation_source
+    )
     _validate_activation_map(prompt_acts, settings.layers, len(prompt.input_ids), "prompt")
     _validate_activation_map(full_acts, settings.layers, len(full.input_ids), "prompt_response")
 
@@ -298,6 +354,7 @@ def build_record_datapoints(
                     source_input_ids=source_ids,
                     source_positions=positions,
                     source_token_mode=settings.source_token_mode,
+                    activation_source=settings.activation_source,
                 )
             )
             point = create_training_datapoint(
@@ -432,13 +489,14 @@ def _record_metadata(
     source_input_ids: tuple[int, ...],
     source_positions: tuple[int, ...],
     source_token_mode: str = "mixed",
+    activation_source: str = "target_lora",
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "record_id": record.record_id,
         "family": record.family,
         "organism_id": record.organism_id,
         "adapter_path": adapter.adapter_path,
-        "activation_source": "target_lora",
+        "activation_source": activation_source,
         "base_model": registry.base_model,
         "base_revision": registry.base_revision,
         "probe_variant": probe_variant,
@@ -600,4 +658,5 @@ def default_target_model_operations() -> TargetModelOperations:
         collect_activations=collect,
         disable_adapter=disable_adapter,
         close=close,
+        collect_base_activations=_collect_base_activations,
     )

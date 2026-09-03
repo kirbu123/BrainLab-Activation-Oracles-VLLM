@@ -20,6 +20,12 @@ def _add_target_data_root_args(parser: argparse.ArgumentParser) -> None:
         default="data/val/cache",
         help="Directory for adapter-on target validation caches",
     )
+    parser.add_argument(
+        "--target-activation-diff",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use adapter-base activation diffs for target-organism validation caches",
+    )
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,7 @@ class DatasetFamilyFlags:
     visual_user_attribute_val: bool = False
     visual_ssc_val: bool = False
     visual_personaqa_val: bool = False
+    target_activation_diff: bool = False
     target_adapter_registry: str = "data/val/target_organisms/adapter_registry.json"
     target_val_root: str = "data/val"
     target_cache_dir: str = "data/val/cache"
@@ -180,6 +187,7 @@ def parse_eval_launch_args(argv: list[str] | None = None) -> OracleModalityEvalA
         visual_user_attribute_val=namespace.visual_user_attribute_val,
         visual_ssc_val=namespace.visual_ssc_val,
         visual_personaqa_val=namespace.visual_personaqa_val,
+        target_activation_diff=namespace.target_activation_diff,
         target_adapter_registry=namespace.target_adapter_registry,
         target_val_root=namespace.target_val_root,
         target_cache_dir=namespace.target_cache_dir,
@@ -215,6 +223,7 @@ def parse_launch_args(argv: list[str] | None = None) -> DatasetFamilyFlags:
         visual_user_attribute_val=namespace.visual_user_attribute_val,
         visual_ssc_val=namespace.visual_ssc_val,
         visual_personaqa_val=namespace.visual_personaqa_val,
+        target_activation_diff=namespace.target_activation_diff,
         target_adapter_registry=namespace.target_adapter_registry,
         target_val_root=namespace.target_val_root,
         target_cache_dir=namespace.target_cache_dir,
@@ -249,6 +258,8 @@ def enabled_family_tokens(flags: DatasetFamilyFlags) -> list[str]:
         tokens.append("vssc")
     if flags.visual_personaqa_val:
         tokens.append("vpqa")
+    if flags.target_activation_diff:
+        tokens.append("adiff")
     return tokens
 
 
@@ -280,3 +291,9 @@ def target_validation_enabled(flags: DatasetFamilyFlags) -> bool:
 def compose_wandb_suffix(flags: DatasetFamilyFlags, model_name: str) -> str:
     model_name_str = model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
     return f"_{'_'.join(enabled_family_tokens(flags))}_{model_name_str}"
+
+
+def target_activation_source(flags: DatasetFamilyFlags) -> str:
+    if flags.target_activation_diff:
+        return "adapter_base_diff"
+    return "target_lora"

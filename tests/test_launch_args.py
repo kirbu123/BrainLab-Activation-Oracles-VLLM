@@ -4,7 +4,9 @@ from nl_probes.configs.launch_args import (
     DatasetFamilyFlags,
     compose_wandb_suffix,
     enabled_family_tokens,
+    parse_eval_launch_args,
     parse_launch_args,
+    target_activation_source,
     target_validation_enabled,
     validation_enabled,
 )
@@ -86,3 +88,19 @@ def test_target_validation_flags_and_registry_are_parsed():
     assert flags.target_adapter_registry == "fixtures/registry.json"
     assert "vtaboo" in enabled_family_tokens(flags)
     assert "vssc" in enabled_family_tokens(flags)
+    assert not flags.target_activation_diff
+    assert target_activation_source(flags) == "target_lora"
+
+
+def test_target_activation_diff_is_parsed_for_train_and_eval():
+    train_flags = parse_launch_args(["--target-activation-diff"])
+    assert train_flags.target_activation_diff
+    assert target_activation_source(train_flags) == "adapter_base_diff"
+    assert "adiff" in enabled_family_tokens(train_flags)
+
+    eval_args = parse_eval_launch_args(
+        ["--lora-path", "logs/run/checkpoints/final", "--target-activation-diff"]
+    )
+    assert eval_args.dataset_flags.target_activation_diff
+    assert target_activation_source(eval_args.dataset_flags) == "adapter_base_diff"
+    assert "adiff" in enabled_family_tokens(eval_args.dataset_flags)
