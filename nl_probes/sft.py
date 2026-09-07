@@ -26,8 +26,7 @@ import torch.distributed as dist
 import wandb
 
 from nl_probes.utils.steering_hooks import (
-    add_hook,
-    get_hf_activation_steering_hook,
+    oracle_steering_hooks,
 )
 from nl_probes.configs.sft_config import SelfInterpTrainingConfig
 from nl_probes.configs.launch_args import (
@@ -58,6 +57,7 @@ from nl_probes.dataset_classes.visual_spqa_dataset import VisualSPQADatasetConfi
 from nl_probes.dataset_classes.vsr import VSRDatasetConfig, VSRDatasetLoader
 from nl_probes.utils.activation_utils import get_hf_submodule, get_text_only_lora_targets, freeze_vision_parameters
 from nl_probes.utils.common import (
+    is_qwen3_vl,
     is_vlm_model,
     layer_percent_to_layer,
     load_model,
@@ -244,21 +244,24 @@ def train_features_batch(
     batch_steering_vectors = training_batch.steering_vectors
     batch_positions = training_batch.positions
 
-    # 3. Create and apply the activation steering hook
-    hook_fn = get_hf_activation_steering_hook(
-        vectors=batch_steering_vectors,
-        positions=batch_positions,
-        steering_coefficient=cfg.steering_coefficient,
-        device=device,
-        dtype=dtype,
-    )
-
     tokenized_input = {
         "input_ids": training_batch.input_ids,
         "attention_mask": training_batch.attention_mask,
     }
 
-    with add_hook(submodule, hook_fn):
+    with oracle_steering_hooks(
+        model=model,
+        decoder_submodule=submodule,
+        batch_steering_vectors=batch_steering_vectors,
+        batch_positions=batch_positions,
+        steering_coefficient=cfg.steering_coefficient,
+        device=device,
+        dtype=dtype,
+        use_deepstack_injection=cfg.use_deepstack_injection,
+        hook_onto_layer=cfg.hook_onto_layer,
+        deepstack_steering_vectors=training_batch.deepstack_steering_vectors,
+        deepstack_positions=training_batch.deepstack_positions,
+    ):
         loss = model(**tokenized_input, labels=training_batch.labels).loss
 
     return loss
@@ -291,6 +294,8 @@ def eval_all_datasets(
             steering_coefficient=cfg.steering_coefficient,
             generation_kwargs=cfg.generation_kwargs,
             processor=processor,
+            use_deepstack_injection=cfg.use_deepstack_injection,
+            hook_onto_layer=cfg.hook_onto_layer,
         )
         eval_results.update(
             score_eval_dataset(
@@ -329,7 +334,12 @@ def oom_preflight_check(
 ) -> None:
     longest_prompt = max(training_data, key=lambda x: len(x.input_ids))
     long_prompts = [longest_prompt] * cfg.train_batch_size
-    long_prompts = materialize_missing_steering_vectors(long_prompts, tokenizer, model)
+    long_prompts = materialize_missing_steering_vectors(
+        long_prompts,
+        tokenizer,
+        model,
+        use_deepstack_injection=cfg.use_deepstack_injection,
+    )
     largest_possible_batch = construct_batch(long_prompts, tokenizer, device)
 
     dummy_optimizer = torch.optim.AdamW(model.parameters(), lr=0.0)
@@ -369,6 +379,8 @@ def train_model(
     }
 
     set_seed(cfg.seed)
+    if cfg.use_deepstack_injection and not is_qwen3_vl(cfg.model_name):
+        raise ValueError(f"DeepStack injection requires Qwen3-VL, got {cfg.model_name}")
     model = load_model(cfg.model_name, dtype, **model_kwargs)
     processor = load_processor(cfg.model_name) if is_vlm_model(cfg.model_name) else None
 
@@ -517,7 +529,11 @@ def train_model(
 
             # Compute missing steering vectors using the PEFT model (not DDP wrapper)
             t_batch_list = materialize_missing_steering_vectors(
-                t_batch_list, tokenizer, model, processor=processor
+                t_batch_list,
+                tokenizer,
+                model,
+                processor=processor,
+                use_deepstack_injection=cfg.use_deepstack_injection,
             )
 
             t_batch = construct_batch(t_batch_list, tokenizer, device)
@@ -1379,6 +1395,7 @@ if __name__ == "__main__":
                 dataset_families=dataset_flags.as_dict(),
                 target_adapter_registry=dataset_flags.target_adapter_registry,
                 target_activation_source=target_activation_source(dataset_flags),
+                use_deepstack_injection=dataset_flags.deepstack_injection,
                 run_id=run_id,
             )
             cfg_kwargs.update(hyperparam_override)

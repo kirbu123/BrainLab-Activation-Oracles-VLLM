@@ -2,10 +2,17 @@ from typing import Any, Mapping
 
 import torch
 from peft import PeftModel
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from nl_probes.utils.activation_utils import collect_activations_multiple_layers, get_hf_submodule
+from nl_probes.utils.activation_utils import (
+    _extract_deepstack_from_visual_output,
+    _get_vision_module,
+    align_deepstack_to_oracle_slots,
+    collect_activations_multiple_layers,
+    collect_deepstack_features,
+    get_hf_submodule,
+)
 
 SPECIAL_TOKEN = " ?"
 
@@ -54,6 +61,8 @@ class TrainingDataPoint(BaseModel):
     ds_label: str | None  # label from the dataset
     meta_info: Mapping[str, Any] = {}
     oracle_question: str = ""
+    deepstack_steering_vectors: list[torch.Tensor] | None = None
+    deepstack_positions: list[int] | None = None
 
     @model_validator(mode="after")
     def _check_context_alignment(cls, values):
@@ -66,6 +75,20 @@ class TrainingDataPoint(BaseModel):
                 raise ValueError("context_* must be provided when steering_vectors is None")
             if len(values.positions) != len(values.context_positions):
                 raise ValueError("positions and context_positions must have the same length")
+        ds_vecs = values.deepstack_steering_vectors
+        if ds_vecs is not None:
+            if values.deepstack_positions is None:
+                raise ValueError("deepstack_positions is required when deepstack_steering_vectors is set")
+            for layer_idx, tensor in enumerate(ds_vecs):
+                if tensor.ndim != 2:
+                    raise ValueError(
+                        f"deepstack_steering_vectors[{layer_idx}] must be [K, D], got {tuple(tensor.shape)}"
+                    )
+                if tensor.shape[0] != len(values.deepstack_positions):
+                    raise ValueError(
+                        f"deepstack_steering_vectors[{layer_idx}] has {tensor.shape[0]} rows, "
+                        f"expected {len(values.deepstack_positions)}"
+                    )
         return values
 
 
@@ -80,6 +103,8 @@ class BatchData(BaseModel):
     steering_vectors: list[torch.Tensor]
     positions: list[list[int]]
     feature_indices: list[int]
+    deepstack_steering_vectors: list[list[torch.Tensor]] = Field(default_factory=list)
+    deepstack_positions: list[list[int]] = Field(default_factory=list)
 
 
 def construct_batch(
@@ -97,6 +122,14 @@ def construct_batch(
     batch_positions = []
     batch_steering_vectors = []
     batch_feature_indices = []
+    batch_deepstack_vectors: list[list[torch.Tensor]] = []
+    batch_deepstack_positions: list[list[int]] = []
+
+    n_deepstack_layers = 0
+    for data_point in training_data:
+        if data_point.deepstack_steering_vectors:
+            n_deepstack_layers = len(data_point.deepstack_steering_vectors)
+            break
 
     for data_point in training_data:
         padding_length = max_length - len(data_point.input_ids)
@@ -125,6 +158,16 @@ def construct_batch(
         batch_steering_vectors.append(steering_vectors)
         batch_feature_indices.append(data_point.feature_idx)
 
+        if n_deepstack_layers == 0 or data_point.deepstack_steering_vectors is None:
+            batch_deepstack_vectors.append([])
+            batch_deepstack_positions.append([])
+        else:
+            padded_ds_positions = [p + padding_length for p in data_point.deepstack_positions]
+            batch_deepstack_positions.append(padded_ds_positions)
+            batch_deepstack_vectors.append(
+                [tensor.to(device) for tensor in data_point.deepstack_steering_vectors]
+            )
+
     return BatchData(
         input_ids=torch.stack(batch_tokens),
         labels=torch.stack(batch_labels),
@@ -132,6 +175,8 @@ def construct_batch(
         steering_vectors=batch_steering_vectors,
         positions=batch_positions,
         feature_indices=batch_feature_indices,
+        deepstack_steering_vectors=batch_deepstack_vectors,
+        deepstack_positions=batch_deepstack_positions,
     )
 
 
@@ -163,6 +208,7 @@ def materialize_missing_steering_vectors(
     tokenizer: AutoTokenizer,
     model: PeftModel,
     processor=None,
+    use_deepstack_injection: bool = False,
 ) -> list[TrainingDataPoint]:
     """
     Materialization of missing steering vectors for a heterogenous batch
@@ -173,34 +219,54 @@ def materialize_missing_steering_vectors(
       2) Text items: left-padded batch from context_input_ids (existing path).
       3) Image items: per-example multimodal forward using stored target messages.
       4) Write back a [num_positions, D] tensor to dp.steering_vectors.
+      5) If use_deepstack_injection, also fill encoder DeepStack rows for image items.
 
-    No-op if every item already has steering_vectors.
+    No-op if every item already has steering_vectors (and DeepStack rows when requested).
     """
-    # Select datapoints that need generation
-    to_fill: list[tuple[int, TrainingDataPoint]] = [
+    to_fill_decoder: list[tuple[int, TrainingDataPoint]] = [
         (i, dp) for i, dp in enumerate(batch_points) if dp.steering_vectors is None
     ]
-    if not to_fill:
+    to_fill_image: list[tuple[int, TrainingDataPoint]] = [
+        (i, dp)
+        for i, dp in enumerate(batch_points)
+        if dp.context_image_paths
+        and (
+            dp.steering_vectors is None
+            or (use_deepstack_injection and dp.deepstack_steering_vectors is None)
+        )
+    ]
+    if not to_fill_decoder and not to_fill_image:
         return batch_points
 
     assert isinstance(model, PeftModel), "Model must be a PeftModel"
 
-    # Validate context fields
-    for _, dp in to_fill:
+    for _, dp in to_fill_decoder:
         if dp.context_positions is None or dp.context_input_ids is None:
             raise ValueError(
                 "Datapoint has steering_vectors=None but is missing context_input_ids or context_positions"
             )
 
-    text_items = [(i, dp) for i, dp in to_fill if not dp.context_image_paths]
-    image_items = [(i, dp) for i, dp in to_fill if dp.context_image_paths]
+    text_items = [(i, dp) for i, dp in to_fill_decoder if not dp.context_image_paths]
+    visual_token_ids = None
+    if use_deepstack_injection and to_fill_image:
+        from nl_probes.utils.vlm_utils import visual_token_ids_from_tokenizer
+
+        visual_token_ids = visual_token_ids_from_tokenizer(tokenizer)
 
     new_batch: list[TrainingDataPoint] = list(batch_points)
 
     if text_items:
         new_batch = _materialize_text_items(new_batch, text_items, tokenizer, model)
-    if image_items:
-        new_batch = _materialize_image_items(new_batch, image_items, model, processor)
+    if to_fill_image:
+        image_items = [(i, new_batch[i]) for i, _ in to_fill_image]
+        new_batch = _materialize_image_items(
+            new_batch,
+            image_items,
+            model,
+            processor,
+            use_deepstack_injection=use_deepstack_injection,
+            visual_token_ids=visual_token_ids,
+        )
 
     return new_batch
 
@@ -275,6 +341,8 @@ def _materialize_image_items(
     to_fill: list[tuple[int, TrainingDataPoint]],
     model: PeftModel,
     processor,
+    use_deepstack_injection: bool = False,
+    visual_token_ids: frozenset[int] | None = None,
 ) -> list[TrainingDataPoint]:
     from nl_probes.utils.common import load_processor
     from nl_probes.utils.vlm_utils import vision_inputs_to_device, vlm_tokenize_target
@@ -290,6 +358,11 @@ def _materialize_image_items(
     model.eval()
     try:
         for idx, dp in to_fill:
+            need_decoder = dp.steering_vectors is None
+            need_deepstack = use_deepstack_injection and dp.deepstack_steering_vectors is None
+            if not need_decoder and not need_deepstack:
+                continue
+
             messages = None
             if dp.meta_info:
                 messages = dp.meta_info.get("target_messages")
@@ -321,26 +394,65 @@ def _materialize_image_items(
                 }
                 inputs_BL.update(vision_inputs_to_device(dict(vision), device))
 
-            submodules = {dp.layer: get_hf_submodule(model, dp.layer, use_lora=True)}
-            with model.disable_adapter():
-                acts_by_layer = collect_activations_multiple_layers(
-                    model=model,
-                    submodules=submodules,
-                    inputs_BL=inputs_BL,
-                    min_offset=None,
-                    max_offset=None,
-                )
-            acts_BLD = acts_by_layer[dp.layer]
-            L = acts_BLD.shape[1]
-            idxs = list(dp.context_positions)
-            if any(i < 0 or i >= L for i in idxs):
-                raise IndexError(
-                    f"Activation index out of range for image item {idx}: {idxs} with L={L} "
-                    f"(stored context_input_ids len={len(dp.context_input_ids)})"
-                )
-            vectors = acts_BLD[0, idxs, :].detach().contiguous()
+            captured_deepstack: list[list[torch.Tensor]] = []
+            visual_handle = None
+            if need_deepstack and need_decoder:
+                visual = _get_vision_module(model)
+
+                def _capture_deepstack(_module, _inputs, outputs):
+                    captured_deepstack.append(_extract_deepstack_from_visual_output(outputs))
+
+                visual_handle = visual.register_forward_hook(_capture_deepstack)
+
+            acts_by_layer = None
+            try:
+                with model.disable_adapter():
+                    if need_decoder:
+                        submodules = {dp.layer: get_hf_submodule(model, dp.layer, use_lora=True)}
+                        acts_by_layer = collect_activations_multiple_layers(
+                            model=model,
+                            submodules=submodules,
+                            inputs_BL=inputs_BL,
+                            min_offset=None,
+                            max_offset=None,
+                        )
+                    elif need_deepstack:
+                        captured_deepstack.append(collect_deepstack_features(model, inputs_BL))
+            finally:
+                if visual_handle is not None:
+                    visual_handle.remove()
+
             dp_new = dp.model_copy(deep=True)
-            dp_new.steering_vectors = vectors
+            if need_decoder:
+                acts_BLD = acts_by_layer[dp.layer]
+                L = acts_BLD.shape[1]
+                idxs = list(dp.context_positions)
+                if any(i < 0 or i >= L for i in idxs):
+                    raise IndexError(
+                        f"Activation index out of range for image item {idx}: {idxs} with L={L} "
+                        f"(stored context_input_ids len={len(dp.context_input_ids)})"
+                    )
+                vectors = acts_BLD[0, idxs, :].detach().contiguous()
+                dp_new.steering_vectors = vectors
+
+            if need_deepstack:
+                if not captured_deepstack:
+                    raise ValueError(f"Vision tower did not emit DeepStack features for image item {idx}")
+                if visual_token_ids is None:
+                    raise ValueError("DeepStack alignment requires visual_token_ids")
+                raw_features = [
+                    feat[0].detach().contiguous() if feat.ndim == 3 else feat.detach().contiguous()
+                    for feat in captured_deepstack[0]
+                ]
+                ds_positions, ds_vectors = align_deepstack_to_oracle_slots(
+                    context_input_ids=list(dp.context_input_ids),
+                    context_positions=list(dp.context_positions),
+                    oracle_positions=list(dp.positions),
+                    visual_token_ids=visual_token_ids,
+                    deepstack_features=raw_features,
+                )
+                dp_new.deepstack_positions = ds_positions
+                dp_new.deepstack_steering_vectors = ds_vectors
             new_batch[idx] = dp_new
     finally:
         if was_training:

@@ -7,7 +7,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer
 import torch._dynamo as dynamo
 
-from nl_probes.utils.steering_hooks import add_hook, get_hf_activation_steering_hook
+from nl_probes.utils.steering_hooks import oracle_steering_hooks
 from nl_probes.utils.dataset_utils import (
     BatchData,
     EvalStepResult,
@@ -29,18 +29,11 @@ def eval_features_batch(
     dtype: torch.dtype,
     steering_coefficient: float,
     generation_kwargs: dict,
+    use_deepstack_injection: bool = False,
+    hook_onto_layer: int = 1,
 ) -> list[FeatureResult]:
     batch_steering_vectors = eval_batch.steering_vectors
     batch_positions = eval_batch.positions
-
-    # 3. Create and apply the activation steering hook
-    hook_fn = get_hf_activation_steering_hook(
-        vectors=batch_steering_vectors,
-        positions=batch_positions,
-        steering_coefficient=steering_coefficient,
-        device=device,
-        dtype=dtype,
-    )
 
     tokenized_input = {
         "input_ids": eval_batch.input_ids,
@@ -52,7 +45,19 @@ def eval_features_batch(
 
     feature_results = []
 
-    with add_hook(submodule, hook_fn):
+    with oracle_steering_hooks(
+        model=model,
+        decoder_submodule=submodule,
+        batch_steering_vectors=batch_steering_vectors,
+        batch_positions=batch_positions,
+        steering_coefficient=steering_coefficient,
+        device=device,
+        dtype=dtype,
+        use_deepstack_injection=use_deepstack_injection,
+        hook_onto_layer=hook_onto_layer,
+        deepstack_steering_vectors=eval_batch.deepstack_steering_vectors,
+        deepstack_positions=eval_batch.deepstack_positions,
+    ):
         output_ids = model.generate(**tokenized_input, **generation_kwargs)
 
     # Decode only the newly generated tokens
@@ -112,6 +117,8 @@ def run_evaluation(
     generation_kwargs: dict,
     verbose: bool = False,
     processor=None,
+    use_deepstack_injection: bool = False,
+    hook_onto_layer: int = 1,
 ) -> list[FeatureResult]:
     """Run evaluation and save results."""
     if lora_path is not None:
@@ -130,7 +137,13 @@ def run_evaluation(
             for j in range(len(e_batch)):
                 e_batch[j] = get_prompt_tokens_only(e_batch[j])
 
-            e_batch = materialize_missing_steering_vectors(e_batch, tokenizer, model, processor=processor)
+            e_batch = materialize_missing_steering_vectors(
+                e_batch,
+                tokenizer,
+                model,
+                processor=processor,
+                use_deepstack_injection=use_deepstack_injection,
+            )
 
             e_batch = construct_batch(e_batch, tokenizer, device)
 
@@ -143,6 +156,8 @@ def run_evaluation(
                 dtype=dtype,
                 steering_coefficient=steering_coefficient,
                 generation_kwargs=generation_kwargs,
+                use_deepstack_injection=use_deepstack_injection,
+                hook_onto_layer=hook_onto_layer,
             )
             if verbose:
                 for feature_result in feature_results:

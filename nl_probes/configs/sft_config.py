@@ -26,6 +26,7 @@ class SelfInterpTrainingConfig:
     use_decoder_vectors: bool = True
     generation_kwargs: dict[str, Any] = field(default_factory=lambda: {"do_sample": False, "max_new_tokens": 20})
     steering_coefficient: float = 1.0
+    use_deepstack_injection: bool = False
     dataset_folder: str = "data/cache"
 
     # --- Batching ---

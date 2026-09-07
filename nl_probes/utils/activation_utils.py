@@ -180,6 +180,89 @@ def _get_language_layers(model: torch.nn.Module):
     raise ValueError(f"Could not find language layers on {type(root)}")
 
 
+def _get_vision_module(model: torch.nn.Module) -> torch.nn.Module:
+    root = _unwrap_peft_model(model)
+    candidates = [root]
+    inner = getattr(root, "model", None)
+    if inner is not None:
+        candidates.append(inner)
+    for obj in candidates:
+        for attr in ("visual", "vision_model", "vision_tower"):
+            module = getattr(obj, attr, None)
+            if module is not None:
+                return module
+    raise ValueError(f"Could not find vision module on {type(root)}")
+
+
+def _extract_deepstack_from_visual_output(output) -> list[torch.Tensor]:
+    if hasattr(output, "deepstack_features") and output.deepstack_features is not None:
+        features = list(output.deepstack_features)
+        if not features:
+            raise ValueError("visual output.deepstack_features is empty")
+        return features
+    if isinstance(output, tuple) and len(output) >= 2:
+        maybe = output[-1]
+        if isinstance(maybe, (list, tuple)) and maybe and torch.is_tensor(maybe[0]):
+            return list(maybe)
+    raise ValueError(f"Could not extract DeepStack features from visual output type {type(output)}")
+
+
+def collect_deepstack_features(model: torch.nn.Module, inputs_BL: dict[str, torch.Tensor]) -> list[torch.Tensor]:
+    """Run the vision tower and return DeepStack merger outputs, one tensor per decoder layer."""
+    if "pixel_values" not in inputs_BL:
+        raise ValueError("DeepStack collection requires pixel_values")
+    if "image_grid_thw" not in inputs_BL:
+        raise ValueError("DeepStack collection requires image_grid_thw")
+    visual = _get_vision_module(model)
+    pixel_values = inputs_BL["pixel_values"]
+    grid_thw = inputs_BL["image_grid_thw"]
+    with torch.no_grad():
+        output = visual(pixel_values, grid_thw=grid_thw)
+    features = _extract_deepstack_from_visual_output(output)
+    return [feat.detach() for feat in features]
+
+
+def align_deepstack_to_oracle_slots(
+    context_input_ids: list[int],
+    context_positions: list[int],
+    oracle_positions: list[int],
+    visual_token_ids: frozenset[int],
+    deepstack_features: list[torch.Tensor],
+) -> tuple[list[int], list[torch.Tensor]]:
+    """Map DeepStack visual rows onto the oracle `?` slots whose source tokens are visual."""
+    if len(context_positions) != len(oracle_positions):
+        raise ValueError(
+            f"context_positions length {len(context_positions)} != oracle positions {len(oracle_positions)}"
+        )
+    if not deepstack_features:
+        raise ValueError("deepstack_features must not be empty")
+    visual_pos = [i for i, tok in enumerate(context_input_ids) if tok in visual_token_ids]
+    n_visual = len(visual_pos)
+    for layer_idx, feat in enumerate(deepstack_features):
+        if feat.ndim != 2:
+            raise ValueError(f"DeepStack layer {layer_idx} must be [V, D], got {tuple(feat.shape)}")
+        if feat.shape[0] != n_visual:
+            raise ValueError(
+                f"DeepStack layer {layer_idx} has {feat.shape[0]} visual rows, "
+                f"but context has {n_visual} visual tokens"
+            )
+    pos_to_row = {src_pos: row for row, src_pos in enumerate(visual_pos)}
+    slot_oracle_positions: list[int] = []
+    row_indices: list[int] = []
+    for slot, src_pos in enumerate(context_positions):
+        row = pos_to_row.get(src_pos)
+        if row is None:
+            continue
+        slot_oracle_positions.append(oracle_positions[slot])
+        row_indices.append(row)
+    if not slot_oracle_positions:
+        d_model = deepstack_features[0].shape[-1]
+        empty = [feat.new_zeros((0, d_model)) for feat in deepstack_features]
+        return [], empty
+    aligned = [feat[row_indices].contiguous() for feat in deepstack_features]
+    return slot_oracle_positions, aligned
+
+
 def get_hf_submodule(model: AutoModelForCausalLM, layer: int, use_lora: bool = False):
     """Gets the residual stream submodule for HF transformers"""
     model_name = model.config._name_or_path

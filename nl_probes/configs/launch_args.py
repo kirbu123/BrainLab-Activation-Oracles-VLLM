@@ -4,6 +4,15 @@ import argparse
 from dataclasses import asdict, dataclass
 
 
+def _add_deepstack_injection_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--deepstack-injection",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also inject encoder DeepStack features into early decoder layers (default: off)",
+    )
+
+
 def _add_target_data_root_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--target-adapter-registry",
@@ -39,6 +48,7 @@ class DatasetFamilyFlags:
     visual_ssc_val: bool = False
     visual_personaqa_val: bool = False
     target_activation_diff: bool = False
+    deepstack_injection: bool = False
     target_adapter_registry: str = "data/val/target_organisms/adapter_registry.json"
     target_val_root: str = "data/val"
     target_cache_dir: str = "data/val/cache"
@@ -101,6 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Enable Visual PersonaQA validation (default: disabled)",
     )
+    _add_deepstack_injection_arg(parser)
     _add_target_data_root_args(parser)
     return parser
 
@@ -164,6 +175,7 @@ def build_eval_parser() -> argparse.ArgumentParser:
         default=True,
         help="Evaluate Visual PersonaQA (default: enabled)",
     )
+    _add_deepstack_injection_arg(parser)
     _add_target_data_root_args(parser)
     return parser
 
@@ -188,6 +200,7 @@ def parse_eval_launch_args(argv: list[str] | None = None) -> OracleModalityEvalA
         visual_ssc_val=namespace.visual_ssc_val,
         visual_personaqa_val=namespace.visual_personaqa_val,
         target_activation_diff=namespace.target_activation_diff,
+        deepstack_injection=namespace.deepstack_injection,
         target_adapter_registry=namespace.target_adapter_registry,
         target_val_root=namespace.target_val_root,
         target_cache_dir=namespace.target_cache_dir,
@@ -224,6 +237,7 @@ def parse_launch_args(argv: list[str] | None = None) -> DatasetFamilyFlags:
         visual_ssc_val=namespace.visual_ssc_val,
         visual_personaqa_val=namespace.visual_personaqa_val,
         target_activation_diff=namespace.target_activation_diff,
+        deepstack_injection=namespace.deepstack_injection,
         target_adapter_registry=namespace.target_adapter_registry,
         target_val_root=namespace.target_val_root,
         target_cache_dir=namespace.target_cache_dir,
@@ -260,6 +274,8 @@ def enabled_family_tokens(flags: DatasetFamilyFlags) -> list[str]:
         tokens.append("vpqa")
     if flags.target_activation_diff:
         tokens.append("adiff")
+    if flags.deepstack_injection:
+        tokens.append("deepstack")
     return tokens
 
 

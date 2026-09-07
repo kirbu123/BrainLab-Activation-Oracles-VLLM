@@ -152,16 +152,10 @@ def get_hf_activation_steering_hook(
         raise ValueError("Empty batch")
 
     # Pre-normalize once; we never backprop through these
-    normed_list = [torch.nn.functional.normalize(v_b, dim=-1).detach() for v_b in vectors]
+    normed_list = [_normalize_steering_vectors(v_b) for v_b in vectors]
 
     def hook_fn(module, _input, output):
-        # Normalize output API across model families
-        if isinstance(output, tuple):
-            resid_BLD, *rest = output
-            output_is_tuple = True
-        else:
-            resid_BLD = output
-            output_is_tuple = False
+        resid_BLD, output_is_tuple, rest = _unpack_residual_output(output)
 
         B_actual, L, d_model_actual = resid_BLD.shape
         if B_actual != B:
@@ -171,25 +165,218 @@ def get_hf_activation_steering_hook(
         if L <= 1:
             return (resid_BLD, *rest) if output_is_tuple else resid_BLD
 
-        # Per-batch element work. Vectorized over K_b where safe.
-        for b in range(B):
-            pos_b = positions[b]
-            pos_b = torch.tensor(pos_b, dtype=torch.long, device=device)
-            assert pos_b.min() >= 0
-            assert pos_b.max() < L
-            # Gather original activations at requested slots and compute norms
-            orig_KD = resid_BLD[b, pos_b, :]  # (K_b, d)
-            norms_K1 = orig_KD.norm(dim=-1, keepdim=True)  # (K_b, 1)
-
-            if b == 0:
-                if norms_K1.max() > 300:
-                    print(f"\n\n\n\n\nWARNING: Large norm detected in batch! {norms_K1}\n\n\n\n\n")
-
-            # Build steered vectors for this b
-            steered_KD = (normed_list[b] *  norms_K1 * steering_coefficient).to(dtype)  # (K_b, d)
-
-            resid_BLD[b, pos_b, :] = steered_KD.detach() + orig_KD
+        _apply_steering_writes(
+            resid_BLD,
+            orig_BLD=resid_BLD,
+            vectors=normed_list,
+            positions=positions,
+            steering_coefficient=steering_coefficient,
+            device=device,
+            dtype=dtype,
+        )
 
         return (resid_BLD, *rest) if output_is_tuple else resid_BLD
 
     return hook_fn
+
+
+def _normalize_steering_vectors(vectors: torch.Tensor) -> torch.Tensor:
+    if vectors.numel() == 0:
+        return vectors.detach()
+    return torch.nn.functional.normalize(vectors, dim=-1).detach()
+
+
+def _unpack_residual_output(output):
+    if isinstance(output, tuple):
+        resid_BLD, *rest = output
+        return resid_BLD, True, rest
+    return output, False, ()
+
+
+def _apply_steering_writes(
+    resid_BLD: torch.Tensor,
+    orig_BLD: torch.Tensor,
+    vectors: list[torch.Tensor],
+    positions: list[list[int]],
+    steering_coefficient: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    B = resid_BLD.shape[0]
+    if len(vectors) != B or len(positions) != B:
+        raise ValueError(
+            f"vectors/positions batch mismatch: B={B}, vectors={len(vectors)}, positions={len(positions)}"
+        )
+    for b in range(B):
+        pos_b = positions[b]
+        if len(pos_b) == 0:
+            continue
+        vec_b = vectors[b]
+        if vec_b.shape[0] == 0:
+            continue
+        if vec_b.shape[0] != len(pos_b):
+            raise ValueError(
+                f"batch {b}: {vec_b.shape[0]} steering vectors vs {len(pos_b)} positions"
+            )
+        pos_t = torch.tensor(pos_b, dtype=torch.long, device=device)
+        if pos_t.min() < 0:
+            raise ValueError(f"batch {b}: negative steering position {pos_t.min().item()}")
+        if pos_t.max() >= resid_BLD.shape[1]:
+            raise ValueError(
+                f"batch {b}: steering position {pos_t.max().item()} >= sequence length {resid_BLD.shape[1]}"
+            )
+        orig_KD = orig_BLD[b, pos_t, :]
+        norms_K1 = orig_KD.norm(dim=-1, keepdim=True)
+        if b == 0 and norms_K1.max() > 300:
+            print(f"\n\n\n\n\nWARNING: Large norm detected in batch! {norms_K1}\n\n\n\n\n")
+        steered_KD = (vec_b.to(device=device, dtype=dtype) * norms_K1 * steering_coefficient)
+        resid_BLD[b, pos_t, :] = resid_BLD[b, pos_t, :] + steered_KD.detach()
+
+
+def get_hf_multi_source_steering_hook(
+    write_groups: list[tuple[list[torch.Tensor], list[list[int]]]],
+    steering_coefficient: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Callable:
+    """Apply several +h writes from the unmodified residual.
+
+    Each group is (vectors_per_batch, positions_per_batch). Overlapping positions
+    receive the sum of steered vectors, with norms taken from the original residual.
+    """
+    if not write_groups:
+        raise ValueError("write_groups must not be empty")
+    B = len(write_groups[0][0])
+    if B == 0:
+        raise ValueError("Empty batch")
+    for vectors, positions in write_groups:
+        if len(vectors) != B or len(positions) != B:
+            raise ValueError("All write groups must share the same batch length")
+
+    normed_groups = [
+        ([_normalize_steering_vectors(v_b) for v_b in vectors], positions)
+        for vectors, positions in write_groups
+    ]
+
+    def hook_fn(module, _input, output):
+        resid_BLD, output_is_tuple, rest = _unpack_residual_output(output)
+        B_actual, L, _d_model_actual = resid_BLD.shape
+        if B_actual != B:
+            raise ValueError(f"Batch mismatch: module B={B_actual}, provided vectors B={B}")
+        if L <= 1:
+            return (resid_BLD, *rest) if output_is_tuple else resid_BLD
+
+        orig_BLD = resid_BLD.clone()
+        for vectors, positions in normed_groups:
+            _apply_steering_writes(
+                resid_BLD,
+                orig_BLD=orig_BLD,
+                vectors=vectors,
+                positions=positions,
+                steering_coefficient=steering_coefficient,
+                device=device,
+                dtype=dtype,
+            )
+        return (resid_BLD, *rest) if output_is_tuple else resid_BLD
+
+    return hook_fn
+
+
+def _unwrap_forward_model(model: torch.nn.Module) -> torch.nn.Module:
+    inner = model
+    if hasattr(inner, "module"):
+        inner = inner.module
+    return inner
+
+
+@contextlib.contextmanager
+def oracle_steering_hooks(
+    model: torch.nn.Module,
+    decoder_submodule: torch.nn.Module,
+    batch_steering_vectors: list[torch.Tensor],
+    batch_positions: list[list[int]],
+    steering_coefficient: float,
+    device: torch.device,
+    dtype: torch.dtype,
+    use_deepstack_injection: bool = False,
+    hook_onto_layer: int = 1,
+    deepstack_steering_vectors: list[list[torch.Tensor]] | None = None,
+    deepstack_positions: list[list[int]] | None = None,
+):
+    """Register decoder-act and optional DeepStack encoder steering hooks."""
+    from nl_probes.utils.activation_utils import get_hf_submodule
+
+    decoder_hook = get_hf_activation_steering_hook(
+        vectors=batch_steering_vectors,
+        positions=batch_positions,
+        steering_coefficient=steering_coefficient,
+        device=device,
+        dtype=dtype,
+    )
+    if not use_deepstack_injection:
+        with add_hook(decoder_submodule, decoder_hook):
+            yield
+        return
+
+    if deepstack_steering_vectors is None or deepstack_positions is None:
+        raise ValueError("DeepStack injection requires deepstack_steering_vectors and deepstack_positions")
+
+    n_layers = 0
+    for item_vectors in deepstack_steering_vectors:
+        if item_vectors:
+            n_layers = len(item_vectors)
+            break
+
+    if n_layers == 0:
+        with add_hook(decoder_submodule, decoder_hook):
+            yield
+        return
+
+    inner = _unwrap_forward_model(model)
+    d_model = None
+    for item_vectors in deepstack_steering_vectors:
+        for tensor in item_vectors:
+            d_model = tensor.shape[-1]
+            break
+        if d_model is not None:
+            break
+    if d_model is None:
+        raise ValueError("DeepStack tensors are missing a hidden size")
+
+    per_layer_vectors: list[list[torch.Tensor]] = []
+    for layer_idx in range(n_layers):
+        layer_vecs = []
+        for item_vectors in deepstack_steering_vectors:
+            if not item_vectors:
+                layer_vecs.append(torch.zeros((0, d_model), device=device, dtype=dtype))
+            else:
+                layer_vecs.append(item_vectors[layer_idx])
+        per_layer_vectors.append(layer_vecs)
+
+    with contextlib.ExitStack() as stack:
+        for layer_idx in range(n_layers):
+            if layer_idx == hook_onto_layer:
+                continue
+            hook = get_hf_activation_steering_hook(
+                vectors=per_layer_vectors[layer_idx],
+                positions=deepstack_positions,
+                steering_coefficient=steering_coefficient,
+                device=device,
+                dtype=dtype,
+            )
+            stack.enter_context(add_hook(get_hf_submodule(inner, layer_idx), hook))
+
+        if 0 <= hook_onto_layer < n_layers:
+            combined = get_hf_multi_source_steering_hook(
+                write_groups=[
+                    (batch_steering_vectors, batch_positions),
+                    (per_layer_vectors[hook_onto_layer], deepstack_positions),
+                ],
+                steering_coefficient=steering_coefficient,
+                device=device,
+                dtype=dtype,
+            )
+            stack.enter_context(add_hook(decoder_submodule, combined))
+        else:
+            stack.enter_context(add_hook(decoder_submodule, decoder_hook))
+        yield

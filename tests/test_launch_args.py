@@ -92,6 +92,27 @@ def test_target_validation_flags_and_registry_are_parsed():
     assert target_activation_source(flags) == "target_lora"
 
 
+def test_deepstack_injection_is_off_by_default():
+    flags = parse_launch_args([])
+    assert not flags.deepstack_injection
+    assert "deepstack" not in enabled_family_tokens(flags)
+
+
+def test_deepstack_injection_flag_and_wandb_token():
+    flags = parse_launch_args(["--deepstack-injection"])
+    assert flags.deepstack_injection
+    assert enabled_family_tokens(flags)[-1] == "deepstack"
+    assert compose_wandb_suffix(flags, "Qwen/Qwen3-VL-4B-Instruct").endswith(
+        "_deepstack_Qwen3-VL-4B-Instruct"
+    )
+
+    eval_args = parse_eval_launch_args(
+        ["--lora-path", "logs/run/checkpoints/final", "--deepstack-injection"]
+    )
+    assert eval_args.dataset_flags.deepstack_injection
+    assert "deepstack" in enabled_family_tokens(eval_args.dataset_flags)
+
+
 def test_target_activation_diff_is_parsed_for_train_and_eval():
     train_flags = parse_launch_args(["--target-activation-diff"])
     assert train_flags.target_activation_diff

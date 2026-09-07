@@ -24,6 +24,7 @@ from nl_probes.sft import (
 )
 from nl_probes.utils.activation_utils import freeze_vision_parameters, get_hf_submodule
 from nl_probes.utils.common import (
+    is_qwen3_vl,
     is_vlm_model,
     load_model,
     load_processor,
@@ -114,6 +115,8 @@ def main() -> None:
         raise TypeError("AO_RUN_ID broadcast failed")
 
     model_name = args.model_name
+    if args.dataset_flags.deepstack_injection and not is_qwen3_vl(model_name):
+        raise ValueError(f"DeepStack injection requires Qwen3-VL, got {model_name}")
     dtype = torch.bfloat16
     device = torch.device(f"cuda:{local_rank}")
     layer_percents = [25, 50, 75]
@@ -140,6 +143,7 @@ def main() -> None:
         dataset_families=args.dataset_flags.as_dict(),
         target_adapter_registry=args.dataset_flags.target_adapter_registry,
         target_activation_source=target_activation_source(args.dataset_flags),
+        use_deepstack_injection=args.dataset_flags.deepstack_injection,
         load_lora_path=str(lora_path),
         wandb_suffix=wandb_suffix,
         run_id=run_id,
@@ -215,6 +219,8 @@ def main() -> None:
                     steering_coefficient=cfg.steering_coefficient,
                     generation_kwargs=cfg.generation_kwargs,
                     processor=processor,
+                    use_deepstack_injection=cfg.use_deepstack_injection,
+                    hook_onto_layer=cfg.hook_onto_layer,
                 )
             gathered: list[list[FeatureResult] | None] = [None] * world_size
             dist.all_gather_object(gathered, local_results)
