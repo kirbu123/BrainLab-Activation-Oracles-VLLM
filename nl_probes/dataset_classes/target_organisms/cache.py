@@ -93,6 +93,8 @@ def build_cache_identity(
         }
     )
     probe_config = settings.model_dump(mode="json")
+    # Older caches may have silently dropped images from tuple-valued content.
+    probe_config["target_tokenization_version"] = "json-image-content-v1"
     if settings.token_choice_mode == "default" and not settings.use_deepstack_injection:
         for key in ("token_choice_mode", "token_choice_percent", "token_choice_version", "use_deepstack_injection"):
             del probe_config[key]
@@ -635,12 +637,25 @@ def default_target_model_operations() -> TargetModelOperations:
         model.set_adapter(entry.organism_id)
 
     def tokenize(runtime, messages: Sequence[TargetMessage], add_generation_prompt: bool):
-        message_dicts = [message.model_dump(mode="python") for message in messages]
+        message_dicts = [message.model_dump(mode="json") for message in messages]
         input_ids, inputs = vlm_tokenize_target(
             runtime["processor"],
             message_dicts,
             add_generation_prompt=add_generation_prompt,
         )
+        has_images = any(
+            part["type"] == "image"
+            for message in message_dicts
+            if isinstance(message["content"], list)
+            for part in message["content"]
+        )
+        if has_images:
+            for key in ("pixel_values", "image_grid_thw"):
+                if key not in inputs or inputs[key] is None or inputs[key].numel() == 0:
+                    raise ValueError(
+                        f"Target message contains images but processor returned no {key}; "
+                        "check image serialization and processor image loading"
+                    )
         device = next(runtime["model"].parameters()).device
         return TokenizedTarget(
             input_ids=tuple(input_ids),

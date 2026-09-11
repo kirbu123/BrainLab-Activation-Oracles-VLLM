@@ -64,6 +64,69 @@ def test_real_target_collector_explicitly_runs_vision(monkeypatch, use_deepstack
     assert inputs["pixel_values"].dtype == torch.float32
 
 
+@pytest.mark.parametrize("missing_key", [None, "pixel_values", "image_grid_thw"])
+def test_real_target_tokenizer_preserves_images(missing_key, tmp_path):
+    from PIL import Image
+    from nl_probes.dataset_classes.target_organisms.cache import default_target_model_operations
+    from nl_probes.dataset_classes.target_organisms.schema import TargetMessage
+
+    class Processor:
+        def apply_chat_template(self, messages, **kwargs):
+            assert isinstance(messages[0]["content"], list)
+            assert messages[0]["content"][0]["type"] == "image"
+            result = {
+                "input_ids": torch.tensor([[7, 7, 1]]),
+                "attention_mask": torch.ones(1, 3),
+                "pixel_values": torch.ones(2, 4),
+                "image_grid_thw": torch.tensor([[1, 1, 2]]),
+            }
+            if missing_key is not None:
+                del result[missing_key]
+            return result
+
+    image_path = tmp_path / "image.jpg"
+    Image.new("RGB", (8, 8)).save(image_path)
+    message = TargetMessage.model_validate({
+        "role": "user", "content": [
+            {"type": "image", "image": str(image_path)},
+            {"type": "text", "text": "Describe this image"},
+        ],
+    })
+    assert isinstance(message.model_dump(mode="python")["content"], tuple)
+    runtime = {"model": torch.nn.Linear(1, 1), "processor": Processor()}
+    ops = default_target_model_operations()
+    if missing_key is not None:
+        with pytest.raises(ValueError, match=f"processor returned no {missing_key}"):
+            ops.tokenize(runtime, [message], True)
+    else:
+        result = ops.tokenize(runtime, [message], True)
+        assert result.input_ids == (7, 7, 1)
+        assert result.model_inputs["pixel_values"].shape == (2, 4)
+        assert result.model_inputs["image_grid_thw"].tolist() == [[1, 1, 2]]
+
+
+@pytest.mark.parametrize("mode", ["default", "attn_choice"])
+def test_target_cache_identity_invalidates_pre_image_fix_caches(tmp_path, mode):
+    from nl_probes.dataset_classes.target_organisms.cache import build_cache_identity
+    from nl_probes.dataset_classes.target_organisms.schema import checksum_json
+
+    registry_path, manifest_path, _ = _write_fixture(tmp_path)
+    settings = ProbeSettings(
+        layers=(1,), token_choice_mode=mode,
+        token_choice_percent=10 if mode == "attn_choice" else None,
+    )
+    old_config = settings.model_dump(mode="json")
+    if mode == "default":
+        for key in ("token_choice_mode", "token_choice_percent", "token_choice_version", "use_deepstack_injection"):
+            del old_config[key]
+    identity = build_cache_identity(
+        load_adapter_registry(registry_path), manifest_path, settings, "visual_taboo",
+    )
+    assert identity.probe_checksum != checksum_json(old_config)
+    old_config["target_tokenization_version"] = "json-image-content-v1"
+    assert identity.probe_checksum == checksum_json(old_config)
+
+
 class FakeOracleTokenizer:
     def encode(self, value, add_special_tokens=False):
         assert value == " ?"

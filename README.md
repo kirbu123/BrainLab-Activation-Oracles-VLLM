@@ -234,6 +234,10 @@ on the decoder collection path.
 Standard dataset caches remain source records: attention mode replaces their
 default vectors during materialization and reuses selected validation vectors
 in memory. Target-adapter attention caches have distinct versioned identities.
+Target messages are serialized with list-valued image content before processing;
+image messages must produce nonempty `pixel_values` and `image_grid_thw`.
+The target-cache tokenization version invalidates pre-fix caches in both modes,
+so the next run rebuilds them without deleting standard dataset caches.
 
 Both modes log per-dataset and aggregate mean selected text/visual counts at
 each source layer (`eval_token_count/...`), and actual DeepStack counts at each
