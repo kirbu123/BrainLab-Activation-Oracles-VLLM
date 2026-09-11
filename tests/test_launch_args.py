@@ -22,6 +22,19 @@ def test_dataset_families_are_enabled_by_default():
     assert not flags.visual_personaqa_val
 
 
+def test_eval_steps_default_and_override():
+    assert parse_launch_args([]).eval_steps == 2000
+    flags = parse_launch_args(["--eval-steps", "5000"])
+    assert flags.eval_steps == 5000
+    assert "eval_steps" not in flags.as_dict()
+
+
+@pytest.mark.parametrize("interval", ["0", "-1"])
+def test_eval_steps_must_be_positive(interval):
+    with pytest.raises(ValueError, match="--eval-steps must be a positive integer"):
+        parse_launch_args(["--eval-steps", interval])
+
+
 def test_dataset_families_can_be_disabled_independently():
     flags = parse_launch_args(["--no-visual-spqa", "--no-snli-ve"])
 
@@ -94,10 +107,22 @@ def test_target_validation_flags_and_registry_are_parsed():
 
 def test_deepstack_injection_is_off_by_default():
     flags = parse_launch_args([])
+    assert flags.deepstack_coefficient_init == 1.0
     assert not flags.deepstack_injection
     assert not flags.train_deepstack_coefficients
     assert "deepstack" not in enabled_family_tokens(flags)
     assert "dscoef" not in enabled_family_tokens(flags)
+
+
+@pytest.mark.parametrize("init_value", [0.0, 0.5, 1.0])
+def test_deepstack_coefficient_init_override(init_value):
+    flags = parse_launch_args([
+        "--deepstack-injection",
+        "--deepstack-trainable-coefficients",
+        "--deepstack-coefficient-init", str(init_value),
+    ])
+    assert flags.deepstack_coefficient_init == init_value
+    assert "deepstack_coefficient_init" not in flags.as_dict()
 
 
 def test_deepstack_injection_flag_and_wandb_token():

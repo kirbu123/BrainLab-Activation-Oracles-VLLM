@@ -28,6 +28,7 @@ class SelfInterpTrainingConfig:
     steering_coefficient: float = 1.0
     use_deepstack_injection: bool = False
     train_deepstack_coefficients: bool = False
+    deepstack_coefficient_init: float = 1.0
     dataset_folder: str = "data/cache"
 
     # --- Batching ---

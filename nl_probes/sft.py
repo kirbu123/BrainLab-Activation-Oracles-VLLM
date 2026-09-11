@@ -453,7 +453,7 @@ def train_model(
                 cfg.load_lora_path, n_layers=n_layers, device=device
             )
         else:
-            coeff_module = DeepStackSteeringCoefficients(n_layers, cfg.steering_coefficient).to(device)
+            coeff_module = DeepStackSteeringCoefficients(n_layers, cfg.deepstack_coefficient_init).to(device)
         model.add_module("deepstack_steering_coefficients", coeff_module)
 
     model.print_trainable_parameters()
@@ -1394,7 +1394,6 @@ if __name__ == "__main__":
                     "load_lora_path": None,
                     "dataset_loaders": vlm_loaders,
                     "wandb_suffix": compose_wandb_suffix(dataset_flags, model_name),
-                    "eval_steps": 2000,
                     "eval_on_start": validation_enabled(dataset_flags),
                     "activation_collection_batch_size": max(1, train_batch_size),
                     "eval_batch_size": max(8, train_batch_size * 4),
@@ -1433,7 +1432,7 @@ if __name__ == "__main__":
                 train_batch_size=train_batch_size,
                 activation_collection_batch_size=train_batch_size * 4,
                 eval_batch_size=train_batch_size * 8,
-                eval_steps=10_000,
+                eval_steps=dataset_flags.eval_steps,
                 eval_on_start=True,
                 gradient_checkpointing=gradient_checkpointing,
                 gradient_accumulation_steps=gradient_accumulation_steps,
@@ -1442,6 +1441,7 @@ if __name__ == "__main__":
                 target_activation_source=target_activation_source(dataset_flags),
                 use_deepstack_injection=dataset_flags.deepstack_injection,
                 train_deepstack_coefficients=dataset_flags.train_deepstack_coefficients,
+                deepstack_coefficient_init=dataset_flags.deepstack_coefficient_init,
                 run_id=run_id,
             )
             cfg_kwargs.update(hyperparam_override)

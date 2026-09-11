@@ -56,6 +56,8 @@ class DatasetFamilyFlags:
     target_activation_diff: bool = False
     deepstack_injection: bool = False
     train_deepstack_coefficients: bool = False
+    deepstack_coefficient_init: float = 1.0
+    eval_steps: int = 2000
     target_adapter_registry: str = "data/val/target_organisms/adapter_registry.json"
     target_val_root: str = "data/val"
     target_cache_dir: str = "data/val/cache"
@@ -70,6 +72,18 @@ class DatasetFamilyFlags:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the vision-language Activation Oracle")
+    parser.add_argument(
+        "--eval-steps",
+        type=int,
+        default=2000,
+        help="Optimizer-step interval between validations (default: 2000); final validation always runs when enabled",
+    )
+    parser.add_argument(
+        "--deepstack-coefficient-init",
+        type=float,
+        default=1.0,
+        help="Initial value for fresh trainable DeepStack coefficients (default: 1.0); resumed runs restore saved values",
+    )
     parser.add_argument(
         "--visual-spqa",
         action=argparse.BooleanOptionalAction,
@@ -238,6 +252,8 @@ def parse_launch_args(argv: list[str] | None = None) -> DatasetFamilyFlags:
     namespace = build_parser().parse_args(argv)
     flags = DatasetFamilyFlags(
         visual_spqa=namespace.visual_spqa,
+        eval_steps=namespace.eval_steps,
+        deepstack_coefficient_init=namespace.deepstack_coefficient_init,
         classification=namespace.classification,
         context_prediction=namespace.context_prediction,
         snli_ve=namespace.snli_ve,
@@ -257,6 +273,8 @@ def parse_launch_args(argv: list[str] | None = None) -> DatasetFamilyFlags:
 
 
 def validate_family_flags(flags: DatasetFamilyFlags) -> None:
+    if flags.eval_steps <= 0:
+        raise ValueError("--eval-steps must be a positive integer")
     if not (flags.visual_spqa or flags.classification or flags.context_prediction):
         raise ValueError(
             "No training datasets selected. Enable at least one of "
