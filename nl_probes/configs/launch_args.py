@@ -11,6 +11,12 @@ def _add_deepstack_injection_arg(parser: argparse.ArgumentParser) -> None:
         default=False,
         help="Also inject encoder DeepStack features into early decoder layers (default: off)",
     )
+    parser.add_argument(
+        "--deepstack-trainable-coefficients",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Optimize one DeepStack steering coefficient per injection layer (default: off)",
+    )
 
 
 def _add_target_data_root_args(parser: argparse.ArgumentParser) -> None:
@@ -49,6 +55,7 @@ class DatasetFamilyFlags:
     visual_personaqa_val: bool = False
     target_activation_diff: bool = False
     deepstack_injection: bool = False
+    train_deepstack_coefficients: bool = False
     target_adapter_registry: str = "data/val/target_organisms/adapter_registry.json"
     target_val_root: str = "data/val"
     target_cache_dir: str = "data/val/cache"
@@ -201,6 +208,7 @@ def parse_eval_launch_args(argv: list[str] | None = None) -> OracleModalityEvalA
         visual_personaqa_val=namespace.visual_personaqa_val,
         target_activation_diff=namespace.target_activation_diff,
         deepstack_injection=namespace.deepstack_injection,
+        train_deepstack_coefficients=namespace.deepstack_trainable_coefficients,
         target_adapter_registry=namespace.target_adapter_registry,
         target_val_root=namespace.target_val_root,
         target_cache_dir=namespace.target_cache_dir,
@@ -223,6 +231,7 @@ def validate_eval_family_flags(flags: DatasetFamilyFlags) -> None:
             "No validation datasets selected. Enable at least one of "
             "--classification, --context-prediction, --snli-ve, or a target-organism val flag."
         )
+    _validate_deepstack_coefficient_flags(flags)
 
 
 def parse_launch_args(argv: list[str] | None = None) -> DatasetFamilyFlags:
@@ -238,6 +247,7 @@ def parse_launch_args(argv: list[str] | None = None) -> DatasetFamilyFlags:
         visual_personaqa_val=namespace.visual_personaqa_val,
         target_activation_diff=namespace.target_activation_diff,
         deepstack_injection=namespace.deepstack_injection,
+        train_deepstack_coefficients=namespace.deepstack_trainable_coefficients,
         target_adapter_registry=namespace.target_adapter_registry,
         target_val_root=namespace.target_val_root,
         target_cache_dir=namespace.target_cache_dir,
@@ -251,6 +261,14 @@ def validate_family_flags(flags: DatasetFamilyFlags) -> None:
         raise ValueError(
             "No training datasets selected. Enable at least one of "
             "--visual-spqa, --classification, or --context-prediction."
+        )
+    _validate_deepstack_coefficient_flags(flags)
+
+
+def _validate_deepstack_coefficient_flags(flags: DatasetFamilyFlags) -> None:
+    if flags.train_deepstack_coefficients and not flags.deepstack_injection:
+        raise ValueError(
+            "--deepstack-trainable-coefficients requires --deepstack-injection"
         )
 
 
@@ -276,6 +294,8 @@ def enabled_family_tokens(flags: DatasetFamilyFlags) -> list[str]:
         tokens.append("adiff")
     if flags.deepstack_injection:
         tokens.append("deepstack")
+    if flags.train_deepstack_coefficients:
+        tokens.append("dscoef")
     return tokens
 
 

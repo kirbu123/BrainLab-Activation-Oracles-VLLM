@@ -26,7 +26,12 @@ import torch.distributed as dist
 import wandb
 
 from nl_probes.utils.steering_hooks import (
+    attached_deepstack_coefficients,
+    deepstack_layer_count,
+    load_deepstack_steering_coefficients,
     oracle_steering_hooks,
+    save_deepstack_steering_coefficients,
+    DeepStackSteeringCoefficients,
 )
 from nl_probes.configs.sft_config import SelfInterpTrainingConfig
 from nl_probes.configs.launch_args import (
@@ -229,6 +234,22 @@ This adapter was trained using the lightweight SAE introspection training script
     print(f"Successfully pushed LoRA adapter to: https://huggingface.co/{repo_id}")
 
 
+def _deepstack_coefficient_log(model) -> dict[str, float]:
+    coeffs = attached_deepstack_coefficients(model)
+    if coeffs is None:
+        return {}
+    return {f"deepstack_coefficient/{i}": float(value) for i, value in enumerate(coeffs.detach().float().tolist())}
+
+
+def _maybe_save_deepstack_coefficients(cfg: SelfInterpTrainingConfig, model, directory: str) -> None:
+    if not cfg.train_deepstack_coefficients:
+        return
+    coeffs = attached_deepstack_coefficients(model)
+    if coeffs is None:
+        raise ValueError("train_deepstack_coefficients is on but no coefficients are attached to the model")
+    save_deepstack_steering_coefficients(directory, coeffs)
+
+
 def train_features_batch(
     cfg: SelfInterpTrainingConfig,
     training_batch: BatchData,
@@ -261,9 +282,15 @@ def train_features_batch(
         hook_onto_layer=cfg.hook_onto_layer,
         deepstack_steering_vectors=training_batch.deepstack_steering_vectors,
         deepstack_positions=training_batch.deepstack_positions,
+        deepstack_coefficients=attached_deepstack_coefficients(model),
     ):
         loss = model(**tokenized_input, labels=training_batch.labels).loss
 
+    if cfg.train_deepstack_coefficients:
+        coeffs = attached_deepstack_coefficients(model)
+        if coeffs is None:
+            raise ValueError("train_deepstack_coefficients is on but no coefficients are attached to the model")
+        loss = loss + coeffs.sum() * 0
     return loss
 
 
@@ -296,6 +323,7 @@ def eval_all_datasets(
             processor=processor,
             use_deepstack_injection=cfg.use_deepstack_injection,
             hook_onto_layer=cfg.hook_onto_layer,
+            deepstack_coefficients=attached_deepstack_coefficients(model),
         )
         eval_results.update(
             score_eval_dataset(
@@ -381,6 +409,8 @@ def train_model(
     set_seed(cfg.seed)
     if cfg.use_deepstack_injection and not is_qwen3_vl(cfg.model_name):
         raise ValueError(f"DeepStack injection requires Qwen3-VL, got {cfg.model_name}")
+    if cfg.train_deepstack_coefficients and not cfg.use_deepstack_injection:
+        raise ValueError("train_deepstack_coefficients requires use_deepstack_injection")
     model = load_model(cfg.model_name, dtype, **model_kwargs)
     processor = load_processor(cfg.model_name) if is_vlm_model(cfg.model_name) else None
 
@@ -415,6 +445,16 @@ def train_model(
         load_lora_path = Path(cfg.load_lora_path)
         assert load_lora_path.exists()
         model = PeftModel.from_pretrained(model, load_lora_path, is_trainable=True, autocast_adapter_dtype=True)
+
+    if cfg.train_deepstack_coefficients:
+        n_layers = deepstack_layer_count(model)
+        if cfg.load_lora_path is not None:
+            coeff_module = load_deepstack_steering_coefficients(
+                cfg.load_lora_path, n_layers=n_layers, device=device
+            )
+        else:
+            coeff_module = DeepStackSteeringCoefficients(n_layers, cfg.steering_coefficient).to(device)
+        model.add_module("deepstack_steering_coefficients", coeff_module)
 
     model.print_trainable_parameters()
 
@@ -558,6 +598,7 @@ def train_model(
                         {
                             "train/loss": accumulated_loss,
                             "train/learning_rate": lr_now,
+                            **_deepstack_coefficient_log(model),
                         },
                         step=global_step,
                     )
@@ -574,6 +615,8 @@ def train_model(
                     )
                     tensorboard.add_scalar("train/loss", accumulated_loss, global_step)
                     tensorboard.add_scalar("train/learning_rate", lr_now, global_step)
+                    for name, value in _deepstack_coefficient_log(model).items():
+                        tensorboard.add_scalar(name, value, global_step)
                     if verbose:
                         print(f"Step {global_step} loss: {accumulated_loss}")
 
@@ -587,6 +630,7 @@ def train_model(
                     if rank == 0:
                         checkpoint_dir = f"{cfg.save_dir}/step_{global_step}"
                         model.save_pretrained(checkpoint_dir)
+                        _maybe_save_deepstack_coefficients(cfg, model, checkpoint_dir)
                         assert run_logger is not None
                         run_logger.info("Saved checkpoint: %s", checkpoint_dir)
                         if cfg.hf_push_to_hub and cfg.hf_repo_id:
@@ -611,6 +655,7 @@ def train_model(
         print("Saving final model...")
         final_checkpoint_dir = f"{cfg.save_dir}/final"
         model.save_pretrained(final_checkpoint_dir)
+        _maybe_save_deepstack_coefficients(cfg, model, final_checkpoint_dir)
         assert run_logger is not None
         run_logger.info("Saved final checkpoint: %s", final_checkpoint_dir)
 
@@ -1396,6 +1441,7 @@ if __name__ == "__main__":
                 target_adapter_registry=dataset_flags.target_adapter_registry,
                 target_activation_source=target_activation_source(dataset_flags),
                 use_deepstack_injection=dataset_flags.deepstack_injection,
+                train_deepstack_coefficients=dataset_flags.train_deepstack_coefficients,
                 run_id=run_id,
             )
             cfg_kwargs.update(hyperparam_override)

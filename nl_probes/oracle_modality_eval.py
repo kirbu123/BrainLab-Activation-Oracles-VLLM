@@ -23,6 +23,11 @@ from nl_probes.sft import (
     build_vlm_eval_loaders,
 )
 from nl_probes.utils.activation_utils import freeze_vision_parameters, get_hf_submodule
+from nl_probes.utils.steering_hooks import (
+    attached_deepstack_coefficients,
+    deepstack_layer_count,
+    load_deepstack_steering_coefficients,
+)
 from nl_probes.utils.common import (
     is_qwen3_vl,
     is_vlm_model,
@@ -117,6 +122,8 @@ def main() -> None:
     model_name = args.model_name
     if args.dataset_flags.deepstack_injection and not is_qwen3_vl(model_name):
         raise ValueError(f"DeepStack injection requires Qwen3-VL, got {model_name}")
+    if args.dataset_flags.train_deepstack_coefficients and not args.dataset_flags.deepstack_injection:
+        raise ValueError("train_deepstack_coefficients requires use_deepstack_injection")
     dtype = torch.bfloat16
     device = torch.device(f"cuda:{local_rank}")
     layer_percents = [25, 50, 75]
@@ -144,6 +151,7 @@ def main() -> None:
         target_adapter_registry=args.dataset_flags.target_adapter_registry,
         target_activation_source=target_activation_source(args.dataset_flags),
         use_deepstack_injection=args.dataset_flags.deepstack_injection,
+        train_deepstack_coefficients=args.dataset_flags.train_deepstack_coefficients,
         load_lora_path=str(lora_path),
         wandb_suffix=wandb_suffix,
         run_id=run_id,
@@ -173,6 +181,11 @@ def main() -> None:
         autocast_adapter_dtype=True,
     )
     model.eval()
+    if cfg.train_deepstack_coefficients:
+        coeff_module = load_deepstack_steering_coefficients(
+            lora_path, n_layers=deepstack_layer_count(model), device=device
+        )
+        model.add_module("deepstack_steering_coefficients", coeff_module)
     submodule = get_hf_submodule(model, cfg.hook_onto_layer)
 
     results_started_at = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -221,6 +234,7 @@ def main() -> None:
                     processor=processor,
                     use_deepstack_injection=cfg.use_deepstack_injection,
                     hook_onto_layer=cfg.hook_onto_layer,
+                    deepstack_coefficients=attached_deepstack_coefficients(model),
                 )
             gathered: list[list[FeatureResult] | None] = [None] * world_size
             dist.all_gather_object(gathered, local_results)

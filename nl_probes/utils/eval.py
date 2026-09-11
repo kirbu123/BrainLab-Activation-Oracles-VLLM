@@ -31,6 +31,7 @@ def eval_features_batch(
     generation_kwargs: dict,
     use_deepstack_injection: bool = False,
     hook_onto_layer: int = 1,
+    deepstack_coefficients: torch.Tensor | None = None,
 ) -> list[FeatureResult]:
     batch_steering_vectors = eval_batch.steering_vectors
     batch_positions = eval_batch.positions
@@ -57,6 +58,7 @@ def eval_features_batch(
         hook_onto_layer=hook_onto_layer,
         deepstack_steering_vectors=eval_batch.deepstack_steering_vectors,
         deepstack_positions=eval_batch.deepstack_positions,
+        deepstack_coefficients=deepstack_coefficients,
     ):
         output_ids = model.generate(**tokenized_input, **generation_kwargs)
 
@@ -119,6 +121,7 @@ def run_evaluation(
     processor=None,
     use_deepstack_injection: bool = False,
     hook_onto_layer: int = 1,
+    deepstack_coefficients: torch.Tensor | None = None,
 ) -> list[FeatureResult]:
     """Run evaluation and save results."""
     if lora_path is not None:
@@ -158,6 +161,7 @@ def run_evaluation(
                 generation_kwargs=generation_kwargs,
                 use_deepstack_injection=use_deepstack_injection,
                 hook_onto_layer=hook_onto_layer,
+                deepstack_coefficients=deepstack_coefficients,
             )
             if verbose:
                 for feature_result in feature_results:

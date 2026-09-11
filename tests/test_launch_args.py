@@ -95,12 +95,15 @@ def test_target_validation_flags_and_registry_are_parsed():
 def test_deepstack_injection_is_off_by_default():
     flags = parse_launch_args([])
     assert not flags.deepstack_injection
+    assert not flags.train_deepstack_coefficients
     assert "deepstack" not in enabled_family_tokens(flags)
+    assert "dscoef" not in enabled_family_tokens(flags)
 
 
 def test_deepstack_injection_flag_and_wandb_token():
     flags = parse_launch_args(["--deepstack-injection"])
     assert flags.deepstack_injection
+    assert not flags.train_deepstack_coefficients
     assert enabled_family_tokens(flags)[-1] == "deepstack"
     assert compose_wandb_suffix(flags, "Qwen/Qwen3-VL-4B-Instruct").endswith(
         "_deepstack_Qwen3-VL-4B-Instruct"
@@ -111,6 +114,40 @@ def test_deepstack_injection_flag_and_wandb_token():
     )
     assert eval_args.dataset_flags.deepstack_injection
     assert "deepstack" in enabled_family_tokens(eval_args.dataset_flags)
+
+
+def test_deepstack_trainable_coefficients_flag_and_wandb_token():
+    flags = parse_launch_args(["--deepstack-injection", "--deepstack-trainable-coefficients"])
+    assert flags.train_deepstack_coefficients
+    assert enabled_family_tokens(flags)[-2:] == ["deepstack", "dscoef"]
+    assert compose_wandb_suffix(flags, "Qwen/Qwen3-VL-4B-Instruct").endswith(
+        "_deepstack_dscoef_Qwen3-VL-4B-Instruct"
+    )
+
+    eval_args = parse_eval_launch_args(
+        [
+            "--lora-path",
+            "logs/run/checkpoints/final",
+            "--deepstack-injection",
+            "--deepstack-trainable-coefficients",
+        ]
+    )
+    assert eval_args.dataset_flags.train_deepstack_coefficients
+    assert enabled_family_tokens(eval_args.dataset_flags)[-2:] == ["deepstack", "dscoef"]
+
+
+def test_deepstack_trainable_coefficients_requires_injection():
+    with pytest.raises(
+        ValueError, match="--deepstack-trainable-coefficients requires --deepstack-injection"
+    ):
+        parse_launch_args(["--deepstack-trainable-coefficients"])
+
+    with pytest.raises(
+        ValueError, match="--deepstack-trainable-coefficients requires --deepstack-injection"
+    ):
+        parse_eval_launch_args(
+            ["--lora-path", "logs/run/checkpoints/final", "--deepstack-trainable-coefficients"]
+        )
 
 
 def test_target_activation_diff_is_parsed_for_train_and_eval():

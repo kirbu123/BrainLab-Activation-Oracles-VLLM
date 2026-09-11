@@ -1,7 +1,66 @@
 import contextlib
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Callable
 
 import torch
+import torch.nn as nn
+
+DEEPSTACK_COEFFICIENTS_FILENAME = "deepstack_steering_coefficients.pt"
+
+
+class DeepStackSteeringCoefficients(nn.Module):
+    def __init__(self, n_layers: int, init_value: float):
+        super().__init__()
+        if n_layers <= 0:
+            raise ValueError(f"n_layers must be positive, got {n_layers}")
+        self.weight = nn.Parameter(
+            torch.full((n_layers,), float(init_value), dtype=torch.float32)
+        )
+
+
+def deepstack_layer_count(model: nn.Module) -> int:
+    inner = _unwrap_forward_model(model)
+    vision_config = inner.config.vision_config
+    indexes = vision_config.deepstack_visual_indexes
+    if not indexes:
+        raise ValueError("model.config.vision_config.deepstack_visual_indexes is empty")
+    return len(indexes)
+
+
+def attached_deepstack_coefficients(model: nn.Module) -> torch.Tensor | None:
+    inner = _unwrap_forward_model(model)
+    module = getattr(inner, "deepstack_steering_coefficients", None)
+    if module is None:
+        return None
+    return module.weight
+
+
+def save_deepstack_steering_coefficients(directory: str | Path, coefficients: torch.Tensor) -> Path:
+    path = Path(directory) / DEEPSTACK_COEFFICIENTS_FILENAME
+    torch.save(coefficients.detach().float().cpu(), path)
+    return path
+
+
+def load_deepstack_steering_coefficients(
+    directory: str | Path,
+    n_layers: int,
+    device: torch.device | None = None,
+) -> DeepStackSteeringCoefficients:
+    path = Path(directory) / DEEPSTACK_COEFFICIENTS_FILENAME
+    if not path.is_file():
+        raise FileNotFoundError(f"DeepStack coefficients file not found: {path}")
+    tensor = torch.load(path, map_location="cpu", weights_only=True)
+    if tensor.shape != (n_layers,):
+        raise ValueError(
+            f"DeepStack coefficients shape {tuple(tensor.shape)} != ({n_layers},)"
+        )
+    module = DeepStackSteeringCoefficients(n_layers, 0.0)
+    module.weight.data.copy_(tensor)
+    if device is not None:
+        module = module.to(device)
+    return module
+
 
 def get_vllm_steering_hook(
     vectors: list[torch.Tensor],
@@ -129,9 +188,10 @@ def add_hook(
 def get_hf_activation_steering_hook(
     vectors: list[torch.Tensor],  # len B, each tensor is (K_b, d_model)
     positions: list[list[int]],  # len B, each list has length K_b
-    steering_coefficient: float,
+    steering_coefficient: float | torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
+    detach_write: bool = True,
 ) -> Callable:
     """
     HF hook with debug prints to compare against vLLM.
@@ -173,6 +233,7 @@ def get_hf_activation_steering_hook(
             steering_coefficient=steering_coefficient,
             device=device,
             dtype=dtype,
+            detach_write=detach_write,
         )
 
         return (resid_BLD, *rest) if output_is_tuple else resid_BLD
@@ -198,15 +259,19 @@ def _apply_steering_writes(
     orig_BLD: torch.Tensor,
     vectors: list[torch.Tensor],
     positions: list[list[int]],
-    steering_coefficient: float,
+    steering_coefficient: float | torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
+    detach_write: bool = True,
 ) -> None:
     B = resid_BLD.shape[0]
     if len(vectors) != B or len(positions) != B:
         raise ValueError(
             f"vectors/positions batch mismatch: B={B}, vectors={len(vectors)}, positions={len(positions)}"
         )
+    coeff = steering_coefficient
+    if torch.is_tensor(coeff):
+        coeff = coeff.to(device=device, dtype=dtype)
     for b in range(B):
         pos_b = positions[b]
         if len(pos_b) == 0:
@@ -229,15 +294,21 @@ def _apply_steering_writes(
         norms_K1 = orig_KD.norm(dim=-1, keepdim=True)
         if b == 0 and norms_K1.max() > 300:
             print(f"\n\n\n\n\nWARNING: Large norm detected in batch! {norms_K1}\n\n\n\n\n")
-        steered_KD = (vec_b.to(device=device, dtype=dtype) * norms_K1 * steering_coefficient)
-        resid_BLD[b, pos_t, :] = resid_BLD[b, pos_t, :] + steered_KD.detach()
+        vec_KD = vec_b.to(device=device, dtype=dtype)
+        if detach_write:
+            steered_KD = vec_KD * norms_K1 * coeff
+            resid_BLD[b, pos_t, :] = resid_BLD[b, pos_t, :] + steered_KD.detach()
+        else:
+            steered_KD = vec_KD.detach() * norms_K1.detach() * coeff
+            resid_BLD[b, pos_t, :] = resid_BLD[b, pos_t, :] + steered_KD
 
 
 def get_hf_multi_source_steering_hook(
     write_groups: list[tuple[list[torch.Tensor], list[list[int]]]],
-    steering_coefficient: float,
+    steering_coefficients: Sequence[float | torch.Tensor],
     device: torch.device,
     dtype: torch.dtype,
+    detach_writes: Sequence[bool] | None = None,
 ) -> Callable:
     """Apply several +h writes from the unmodified residual.
 
@@ -246,12 +317,24 @@ def get_hf_multi_source_steering_hook(
     """
     if not write_groups:
         raise ValueError("write_groups must not be empty")
+    if len(steering_coefficients) != len(write_groups):
+        raise ValueError(
+            f"steering_coefficients length {len(steering_coefficients)} != write_groups {len(write_groups)}"
+        )
     B = len(write_groups[0][0])
     if B == 0:
         raise ValueError("Empty batch")
     for vectors, positions in write_groups:
         if len(vectors) != B or len(positions) != B:
             raise ValueError("All write groups must share the same batch length")
+    if detach_writes is None:
+        group_detach = [True] * len(write_groups)
+    else:
+        if len(detach_writes) != len(write_groups):
+            raise ValueError(
+                f"detach_writes length {len(detach_writes)} != write_groups {len(write_groups)}"
+            )
+        group_detach = list(detach_writes)
 
     normed_groups = [
         ([_normalize_steering_vectors(v_b) for v_b in vectors], positions)
@@ -267,15 +350,18 @@ def get_hf_multi_source_steering_hook(
             return (resid_BLD, *rest) if output_is_tuple else resid_BLD
 
         orig_BLD = resid_BLD.clone()
-        for vectors, positions in normed_groups:
+        for (vectors, positions), coefficient, detach_write in zip(
+            normed_groups, steering_coefficients, group_detach, strict=True
+        ):
             _apply_steering_writes(
                 resid_BLD,
                 orig_BLD=orig_BLD,
                 vectors=vectors,
                 positions=positions,
-                steering_coefficient=steering_coefficient,
+                steering_coefficient=coefficient,
                 device=device,
                 dtype=dtype,
+                detach_write=detach_write,
             )
         return (resid_BLD, *rest) if output_is_tuple else resid_BLD
 
@@ -302,6 +388,7 @@ def oracle_steering_hooks(
     hook_onto_layer: int = 1,
     deepstack_steering_vectors: list[list[torch.Tensor]] | None = None,
     deepstack_positions: list[list[int]] | None = None,
+    deepstack_coefficients: torch.Tensor | None = None,
 ):
     """Register decoder-act and optional DeepStack encoder steering hooks."""
     from nl_probes.utils.activation_utils import get_hf_submodule
@@ -312,6 +399,7 @@ def oracle_steering_hooks(
         steering_coefficient=steering_coefficient,
         device=device,
         dtype=dtype,
+        detach_write=True,
     )
     if not use_deepstack_injection:
         with add_hook(decoder_submodule, decoder_hook):
@@ -331,6 +419,12 @@ def oracle_steering_hooks(
         with add_hook(decoder_submodule, decoder_hook):
             yield
         return
+
+    if deepstack_coefficients is not None and deepstack_coefficients.numel() != n_layers:
+        raise ValueError(
+            f"DeepStack coefficients length {deepstack_coefficients.numel()} != n_layers {n_layers}"
+        )
+    detach_deepstack = deepstack_coefficients is None
 
     inner = _unwrap_forward_model(model)
     d_model = None
@@ -353,6 +447,11 @@ def oracle_steering_hooks(
                 layer_vecs.append(item_vectors[layer_idx])
         per_layer_vectors.append(layer_vecs)
 
+    def _layer_coeff(layer_idx: int) -> float | torch.Tensor:
+        if deepstack_coefficients is None:
+            return steering_coefficient
+        return deepstack_coefficients[layer_idx]
+
     with contextlib.ExitStack() as stack:
         for layer_idx in range(n_layers):
             if layer_idx == hook_onto_layer:
@@ -360,9 +459,10 @@ def oracle_steering_hooks(
             hook = get_hf_activation_steering_hook(
                 vectors=per_layer_vectors[layer_idx],
                 positions=deepstack_positions,
-                steering_coefficient=steering_coefficient,
+                steering_coefficient=_layer_coeff(layer_idx),
                 device=device,
                 dtype=dtype,
+                detach_write=detach_deepstack,
             )
             stack.enter_context(add_hook(get_hf_submodule(inner, layer_idx), hook))
 
@@ -372,9 +472,10 @@ def oracle_steering_hooks(
                     (batch_steering_vectors, batch_positions),
                     (per_layer_vectors[hook_onto_layer], deepstack_positions),
                 ],
-                steering_coefficient=steering_coefficient,
+                steering_coefficients=[steering_coefficient, _layer_coeff(hook_onto_layer)],
                 device=device,
                 dtype=dtype,
+                detach_writes=[True, detach_deepstack],
             )
             stack.enter_context(add_hook(decoder_submodule, combined))
         else:
