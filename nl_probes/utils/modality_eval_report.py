@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from nl_probes.utils.token_choice import render_token_counts
+
 MODE_COLORS = {
     "mixed": "#7dcea0",
     "text": "#79b8ff",
@@ -432,6 +434,13 @@ def render_modality_eval_html(payload: dict[str, Any]) -> str:
             )
     stats_html = "".join(stat_cards)
     stats_cols = max(len(modes), 1)
+    selection_note = _mode_blurbs_html(modes) + " K matches the original datapoint."
+    if payload.get("token_choice_mode", "default") == "attn_choice":
+        selection_note = (
+            f"Attention received, independently per source layer; {payload['token_choice_percent']:g}% "
+            "of eligible tokens after protected-span exclusions and the modality filter. "
+            "Mixed permits both modalities. K can differ across modes."
+        )
 
     ans_svg = grouped_bar_svg(standard, modes, "answer", chance=0.5) if standard else ""
     fmt_svg = grouped_bar_svg(standard, modes, "format", chance=None) if standard else ""
@@ -570,11 +579,12 @@ def render_modality_eval_html(payload: dict[str, Any]) -> str:
   <div class="stats">{stats_html}</div>
   <p class="note">
     Same oracle LoRA, same val items. Only the <em>source residual positions</em> copied into the oracle change.
-    {_mode_blurbs_html(modes)}
-    K matches the original datapoint. Dashed line is 50% chance for binary Yes/No.
+    {selection_note}
+    Dashed line is 50% chance for binary Yes/No.
   </p>
   {ans_section}
   {tgt_section}
+  {render_token_counts(payload["metrics"])}
 </body>
 </html>
 """
@@ -713,6 +723,22 @@ def render_modality_eval_markdown(payload: dict[str, Any]) -> str:
             "| `target_validation_predictions_{mixed,text,visual}.jsonl` | "
             "Per-row secret-keeping scores |\n"
         )
+    if payload.get("token_choice_mode", "default") == "attn_choice":
+        counts = "\n".join(
+            f"| {key} | {value:.3f} |" for key, value in sorted(payload["metrics"].items())
+            if key.startswith(("eval_token_count/", "eval_deepstack_token_count/"))
+        )
+        return (
+            f"# Attention-selected source-token evaluation\n\nRun: `{run_id}`\n\n"
+            f"Oracle: `{lora_path}`\n\nSource layers: {layers}. "
+            f"Select {payload['token_choice_percent']:g}% of eligible tokens per layer "
+            "by attention received, averaged over heads and non-padding queries. "
+            "Protected spans and the modality filter are applied before computing K. "
+            "Mixed permits both modalities; K may differ across modes.\n\n"
+            f"## Answer accuracy\n\n{ans_md}\n\n## Format accuracy\n\n{fmt_md}\n\n"
+            f"{tgt_block}\n## Validation token counts\n\n"
+            f"| Dataset / layer / count | Mean or examples |\n|---|---:|\n{counts}\n"
+        )
     return (
         "# Source-token selection eval\n\n"
         "Eval-only ablation of which **target residual positions** are copied into the "
@@ -778,4 +804,3 @@ def write_modality_eval_report(
     html_path.write_text(render_modality_eval_html(payload), encoding="utf-8")
     md_path.write_text(render_modality_eval_markdown(payload), encoding="utf-8")
     return json_path, html_path, md_path
-

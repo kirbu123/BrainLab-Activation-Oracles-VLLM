@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from nl_probes.utils.token_choice import render_token_counts
+
 
 @dataclass
 class LossPoint:
@@ -62,6 +64,8 @@ class ResultsHtmlLogger:
             "lora_r": getattr(cfg, "lora_r", None),
             "lora_alpha": getattr(cfg, "lora_alpha", None),
             "act_layers": list(getattr(cfg, "act_layers", []) or []),
+            "token_choice_mode": getattr(cfg, "token_choice_mode", "default"),
+            "token_choice_percent": getattr(cfg, "token_choice_percent", None),
             "losses": [asdict(p) for p in self.losses],
             "evals": [asdict(p) for p in self.evals],
             **(extra or {}),
@@ -233,6 +237,8 @@ def render_results_html(payload: dict[str, Any]) -> str:
         ("Updated", payload.get("updated_at") or "—"),
         ("Eval every", str(payload.get("eval_steps") or "—") + " steps"),
         ("Layers", ",".join(str(x) for x in payload.get("act_layers") or []) or "—"),
+        ("Token choice", payload.get("token_choice_mode", "default")),
+        ("Token choice percent", str(payload.get("token_choice_percent"))),
         ("LoRA", f"r={payload.get('lora_r')} α={payload.get('lora_alpha')}"),
         ("Loss points", str(len(losses))),
         ("Val steps logged", str(len(evals))),
@@ -350,6 +356,7 @@ def render_results_html(payload: dict[str, Any]) -> str:
       </table>
     </div>
   </div>
+  {render_token_counts(latest["metrics"] if latest else {})}
 </body>
 </html>
 """

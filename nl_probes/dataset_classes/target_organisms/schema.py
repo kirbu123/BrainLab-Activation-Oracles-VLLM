@@ -255,6 +255,17 @@ class TargetValidationManifest(StrictModel):
 
 
 class ProbeSettings(StrictModel):
+    token_choice_mode: Literal["default", "attn_choice"] = "default"
+    token_choice_percent: float | None = None
+    token_choice_version: str = "received-attention-safe-spans-v1"
+    use_deepstack_injection: bool = False
+
+    @model_validator(mode="after")
+    def validate_selection(self):
+        from nl_probes.utils.token_choice import validate_token_choice
+        validate_token_choice(self.token_choice_mode, self.token_choice_percent)
+        return self
+
     layers: Annotated[tuple[int, ...], BeforeValidator(_json_array_to_tuple)] = Field(
         min_length=1
     )

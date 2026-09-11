@@ -29,6 +29,8 @@ class SelfInterpTrainingConfig:
     use_deepstack_injection: bool = False
     train_deepstack_coefficients: bool = False
     deepstack_coefficient_init: float = 1.0
+    token_choice_mode: str = "default"
+    token_choice_percent: float | None = None
     dataset_folder: str = "data/cache"
 
     # --- Batching ---
@@ -78,6 +80,8 @@ class SelfInterpTrainingConfig:
     positive_negative_examples: bool = False
 
     def finalize(self, dataset_loaders: list[ActDatasetLoader]) -> "SelfInterpTrainingConfig":
+        from nl_probes.utils.token_choice import validate_token_choice
+        validate_token_choice(self.token_choice_mode, self.token_choice_percent)
         self.dataset_configs = [asdict(dataset_loader.dataset_config) for dataset_loader in dataset_loaders]
         # act_layers from percents if caller did not set them directly
         if not self.act_layers:

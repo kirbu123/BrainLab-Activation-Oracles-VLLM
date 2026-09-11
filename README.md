@@ -203,6 +203,42 @@ and `nl_probes/configs/sft_config.py`.
 
 ## Source-token modality evaluation
 
+### Source-token selection
+
+Training and evaluation accept `--token-choice-mode default` (the existing
+dataset-specific selection) or `--token-choice-mode attn_choice` with a required
+`--token-choice-percent P`, where `0 < P <= 100`. For example:
+
+```bash
+bash scripts/run_vlm_ao_4gpu.sh \
+  --deepstack-injection --deepstack-trainable-coefficients \
+  --deepstack-coefficient-init 0.0 --eval-steps 5000 \
+  --token-choice-mode attn_choice --token-choice-percent 10
+```
+
+Attention mode ranks tokens by attention **received**: mean `A[query, token]`
+over heads and non-padding queries, independently at each source decoder layer.
+It selects `max(1, floor(N * P / 100))` tokens from the eligible pool, excludes
+SPQA's hidden system prefix and caption prediction target spans, and restores
+source order after ranking. These exclusions prevent direct selection of the
+protected spans, not information already propagated to other hidden states.
+Text/visual modality evaluation filters the pool before applying the percentage.
+Ties prefer earlier source positions; empty eligible pools fail explicitly.
+
+DeepStack uses only the visual subset of the selected positions. Collection
+temporarily uses eager decoder attention, which has quadratic attention-map
+memory cost; the normal backend is restored before oracle training/generation.
+Standard dataset caches remain source records: attention mode replaces their
+default vectors during materialization and reuses selected validation vectors
+in memory. Target-adapter attention caches have distinct versioned identities.
+
+Both modes log per-dataset and aggregate mean selected text/visual counts at
+each source layer (`eval_token_count/...`), and actual DeepStack counts at each
+destination layer when enabled (`eval_deepstack_token_count/...`). Means include
+zero-visual examples and have accompanying example counts. Metrics appear in
+training logs, TensorBoard/W&B, JSON and HTML; standalone modality evaluation
+records them with the modality suffix.
+
 After a training run finishes, evaluate the same LoRA three times: current
 mixed positions, text-token positions only, and visual-token (`<|image_pad|>`)
 positions only. This is a separate 4-GPU job and does not train.

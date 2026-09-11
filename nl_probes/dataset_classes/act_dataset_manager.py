@@ -81,6 +81,16 @@ class ActDatasetLoader:
         data_dicts = saved_object["data"]
         data = [TrainingDataPoint(**d) for d in data_dicts]
 
+        if "qwen3-vl" in self.dataset_config.model_name.lower() and any(
+            point.context_input_ids is None and "source_input_ids" not in point.meta_info
+            for point in data
+        ):
+            # Old activation-only caches cannot support source-token accounting.
+            self.create_dataset()
+            data = [TrainingDataPoint(**d) for d in torch.load(filepath)["data"]]
+            if any(point.context_input_ids is None and "source_input_ids" not in point.meta_info for point in data):
+                raise ValueError(f"Rebuilt VLM cache lacks source token IDs: {filepath}")
+
         print(f"Loaded {len(data)} datapoints from {filepath}")
         return data
 

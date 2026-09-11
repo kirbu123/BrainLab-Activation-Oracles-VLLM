@@ -122,6 +122,9 @@ def run_evaluation(
     use_deepstack_injection: bool = False,
     hook_onto_layer: int = 1,
     deepstack_coefficients: torch.Tensor | None = None,
+    token_choice_mode: str = "default",
+    token_choice_percent: float | None = None,
+    source_token_mode: str = "mixed",
 ) -> list[FeatureResult]:
     """Run evaluation and save results."""
     if lora_path is not None:
@@ -137,16 +140,27 @@ def run_evaluation(
         ):
             e_batch = eval_data[i : i + eval_batch_size]
 
-            for j in range(len(e_batch)):
-                e_batch[j] = get_prompt_tokens_only(e_batch[j])
-
             e_batch = materialize_missing_steering_vectors(
                 e_batch,
                 tokenizer,
                 model,
                 processor=processor,
                 use_deepstack_injection=use_deepstack_injection,
+                token_choice_mode=token_choice_mode,
+                token_choice_percent=token_choice_percent,
+                source_token_mode=source_token_mode,
             )
+
+            # Attention-selected vectors are CPU-backed; preserve default cache behavior.
+            if token_choice_mode == "attn_choice":
+                eval_data[i : i + len(e_batch)] = e_batch
+            from nl_probes.utils.token_choice import token_count_record
+            from nl_probes.utils.vlm_utils import visual_token_ids_from_tokenizer
+            visual_ids = visual_token_ids_from_tokenizer(tokenizer) if processor is not None else frozenset()
+            from nl_probes.utils.steering_hooks import deepstack_layer_count
+            ds_layers = deepstack_layer_count(model) if use_deepstack_injection else 0
+            counts = [token_count_record(point, visual_ids, ds_layers) for point in e_batch]
+            e_batch = [get_prompt_tokens_only(point) for point in e_batch]
 
             e_batch = construct_batch(e_batch, tokenizer, device)
 
@@ -166,6 +180,8 @@ def run_evaluation(
             if verbose:
                 for feature_result in feature_results:
                     print(f"\n=== Feature {feature_result.feature_idx} : {feature_result.api_response} ===\n")
+            for response, record in zip(feature_results, counts, strict=True):
+                response.token_counts = record
             all_feature_results.extend(feature_results)
 
         # save_logs(

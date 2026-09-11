@@ -31,6 +31,7 @@ class FeatureResult(BaseModel):
     api_response: str
     prompt: str
     meta_info: Mapping[str, Any] = {}
+    token_counts: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvalStepResult(BaseModel):
@@ -209,6 +210,9 @@ def materialize_missing_steering_vectors(
     model: PeftModel,
     processor=None,
     use_deepstack_injection: bool = False,
+    token_choice_mode: str = "default",
+    token_choice_percent: float | None = None,
+    source_token_mode: str = "mixed",
 ) -> list[TrainingDataPoint]:
     """
     Materialization of missing steering vectors for a heterogenous batch
@@ -223,6 +227,14 @@ def materialize_missing_steering_vectors(
 
     No-op if every item already has steering_vectors (and DeepStack rows when requested).
     """
+    from nl_probes.utils.token_choice import validate_token_choice, materialize_attention_choices
+    validate_token_choice(token_choice_mode, token_choice_percent)
+    if token_choice_mode == "attn_choice":
+        return materialize_attention_choices(
+            batch_points, tokenizer, model, processor, token_choice_percent,
+            use_deepstack_injection, source_token_mode,
+        )
+
     to_fill_decoder: list[tuple[int, TrainingDataPoint]] = [
         (i, dp) for i, dp in enumerate(batch_points) if dp.steering_vectors is None
     ]

@@ -16,6 +16,34 @@ from nl_probes.utils.vlm_utils import visual_token_ids_from_tokenizer
 IMAGE_PAD = 7
 
 
+def test_validation_counts_actual_slots_without_oracle_answer_leak(monkeypatch):
+    from nl_probes.utils import eval as evaluation
+    from nl_probes.utils.dataset_utils import FeatureResult
+
+    tokenizer = FakeEvalTokenizer()
+    point = create_training_datapoint(
+        datapoint_type="classification_vsr", prompt="Is it true?", target_response="Yes",
+        layer=9, num_positions=2, tokenizer=tokenizer, acts_BD=torch.ones(2, 4), feature_idx=-1,
+        context_input_ids=[1, IMAGE_PAD, 2, 3], context_positions=[1, 3],
+    )
+    monkeypatch.setattr(evaluation, "construct_batch", lambda points, *args: points)
+
+    def generate(**kwargs):
+        rows = kwargs["eval_batch"]
+        assert all(all(label == -100 for label in row.labels) for row in rows)
+        return [FeatureResult(feature_idx=-1, api_response="Yes", prompt="probe") for row in rows]
+
+    monkeypatch.setattr(evaluation, "eval_features_batch", generate)
+    rows = [point]
+    responses = evaluation.run_evaluation(
+        rows, torch.nn.Identity(), tokenizer, torch.nn.Identity(), torch.device("cpu"),
+        torch.float32, 0, None, 1, 1.0, {}, processor=object(),
+    )
+    assert responses[0].token_counts == {"layer": 9, "text": 1, "visual": 1, "deepstack": []}
+    assert rows[0] is point
+    assert any(label != -100 for label in rows[0].labels)
+
+
 class FakeEvalTokenizer:
     unk_token_id = 0
     pad_token_id = 0

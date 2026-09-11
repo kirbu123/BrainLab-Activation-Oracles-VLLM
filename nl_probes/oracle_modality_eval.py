@@ -152,6 +152,8 @@ def main() -> None:
         target_activation_source=target_activation_source(args.dataset_flags),
         use_deepstack_injection=args.dataset_flags.deepstack_injection,
         train_deepstack_coefficients=args.dataset_flags.train_deepstack_coefficients,
+        token_choice_mode=args.dataset_flags.token_choice_mode,
+        token_choice_percent=args.dataset_flags.token_choice_percent,
         load_lora_path=str(lora_path),
         wandb_suffix=wandb_suffix,
         run_id=run_id,
@@ -193,7 +195,7 @@ def main() -> None:
     n_by_dataset: dict[str, int] = {}
 
     for mode in args.source_tokens:
-        mode_standard = apply_source_token_mode(
+        mode_standard = standard_eval if cfg.token_choice_mode == "attn_choice" else apply_source_token_mode(
             standard_eval,
             mode,
             tokenizer,
@@ -213,6 +215,9 @@ def main() -> None:
         eval_datasets = {**mode_standard, **mode_target}
         if not eval_datasets:
             raise ValueError(f"No validation datasets loaded for source-token mode {mode}")
+
+        from nl_probes.utils.token_choice import token_count_metrics
+        mode_counts = []
 
         for name, rows in eval_datasets.items():
             n_by_dataset[f"{name}/{mode}"] = len(rows)
@@ -235,6 +240,9 @@ def main() -> None:
                     use_deepstack_injection=cfg.use_deepstack_injection,
                     hook_onto_layer=cfg.hook_onto_layer,
                     deepstack_coefficients=attached_deepstack_coefficients(model),
+                    token_choice_mode=cfg.token_choice_mode,
+                    token_choice_percent=cfg.token_choice_percent,
+                    source_token_mode=mode,
                 )
             gathered: list[list[FeatureResult] | None] = [None] * world_size
             dist.all_gather_object(gathered, local_results)
@@ -249,12 +257,17 @@ def main() -> None:
                 global_step=0,
                 details_path=details_path,
             )
+            counts = [response.token_counts for response in responses]
+            mode_counts.extend(counts)
+            metrics.update(token_count_metrics(counts, name))
             prefixed = prefix_metrics(metrics, mode)
             all_metrics.update(prefixed)
             print(
                 f"{mode} {name} format correct: {metrics[f'eval_format_correct/{name}']}, "
                 f"ans correct: {metrics[f'eval_ans_correct/{name}']}"
             )
+        if rank == 0:
+            all_metrics.update(prefix_metrics(token_count_metrics(mode_counts, "all"), mode))
 
     if rank == 0:
         json_path, html_path, md_path = write_modality_eval_report(
@@ -268,6 +281,8 @@ def main() -> None:
                 "run_id": run_id,
                 "act_layers": list(cfg.act_layers),
                 "hook_layer": hook_layer,
+                "token_choice_mode": cfg.token_choice_mode,
+                "token_choice_percent": cfg.token_choice_percent,
                 "started_at": results_started_at,
                 "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             },

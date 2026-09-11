@@ -302,6 +302,52 @@ def test_visual_source_token_mode_selects_image_pad_positions(tmp_path):
     assert list(rows[0].meta_info["source_positions"]) == [1, 2]
 
 
+def test_attention_choice_target_cache_and_deepstack(tmp_path):
+    registry_path, manifest_path, _ = _write_fixture(tmp_path)
+
+    class Tokenizer(FakeOracleTokenizer):
+        unk_token_id = 0
+
+        def convert_tokens_to_ids(self, name):
+            return {"<|image_pad|>": 7, "<|video_pad|>": 8}[name]
+
+    def tokenize(runtime, messages, add_generation_prompt):
+        return TokenizedTarget((7, 3, 7, 4), {"input_ids": torch.tensor([[7, 3, 7, 4]])})
+
+    def features(runtime, tokenized, layers, use_ds):
+        acts = {layer: torch.arange(16).reshape(1, 4, 4).float() for layer in layers}
+        scores = {layer: torch.tensor([[4., 1., 3., 2.]]) if layer == 1
+                  else torch.tensor([[1., 4., 2., 3.]]) for layer in layers}
+        return acts, scores, [torch.ones(2, 4)] if use_ds else []
+
+    ops = TargetModelOperations(
+        load_base=lambda registry: {}, tokenizer=lambda runtime: Tokenizer(),
+        enable_adapter=lambda runtime, entry: None, tokenize=tokenize,
+        generate=lambda *args: "It likes warm windows.",
+        collect_activations=lambda *args: pytest.fail("Must use attention collection"),
+        disable_adapter=lambda *args: None, close=lambda *args: None,
+        collect_attention_features=features,
+        collect_base_activations=lambda runtime, tokenized, layers: {
+            layer: torch.ones(1, 4, 4) for layer in layers},
+    )
+    settings = ProbeSettings(layers=(1, 3), variants=("prompt_tail",), token_choice_mode="attn_choice",
+                             token_choice_percent=50, use_deepstack_injection=True,
+                             activation_source="adapter_base_diff")
+    first = precompute_target_validation_cache(registry_path=registry_path, manifest_path=manifest_path,
+        settings=settings, cache_dir=tmp_path / "cache", operations=ops)
+    rows = load_target_validation_cache(first)
+    assert list(rows[0].meta_info["source_positions"]) == [0, 2]
+    assert list(rows[1].meta_info["source_positions"]) == [1, 3]
+    assert len(rows[0].deepstack_positions) == 2
+    assert len(rows[1].deepstack_positions) == 0
+    assert torch.equal(rows[0].steering_vectors, torch.tensor([[-1., 0., 1., 2.], [7., 8., 9., 10.]]))
+    second = precompute_target_validation_cache(registry_path=registry_path, manifest_path=manifest_path,
+        settings=settings.model_copy(update={"token_choice_percent": 25}),
+        cache_dir=tmp_path / "cache", operations=ops)
+    assert first != second
+    assert len(load_target_validation_cache(second)[0].positions) == 1
+
+
 def test_adapter_base_diff_changes_cached_vectors(tmp_path):
     registry_path, manifest_path, _ = _write_fixture(tmp_path)
     tokenizer = FakeOracleTokenizer()

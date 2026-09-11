@@ -65,6 +65,7 @@ class TargetModelOperations:
     collect_base_activations: Callable[
         [Any, TokenizedTarget, tuple[int, ...]], Mapping[int, torch.Tensor]
     ] | None = None
+    collect_attention_features: Callable | None = None
 
 
 def build_cache_identity(
@@ -91,12 +92,16 @@ def build_cache_identity(
             "revision": registry.base_revision,
         }
     )
+    probe_config = settings.model_dump(mode="json")
+    if settings.token_choice_mode == "default" and not settings.use_deepstack_injection:
+        for key in ("token_choice_mode", "token_choice_percent", "token_choice_version", "use_deepstack_injection"):
+            del probe_config[key]
     return CacheIdentity(
         family=family,
         manifest_checksum=checksum_path(manifest_path),
         adapter_checksums=adapter_checksums,
         model_checksum=model_checksum,
-        probe_checksum=checksum_json(settings.model_dump(mode="json")),
+        probe_checksum=checksum_json(probe_config),
     )
 
 
@@ -286,12 +291,29 @@ def build_record_datapoints(
         TargetMessage(role="assistant", content=response),
     )
     full = operations.tokenize(runtime, full_messages, False)
-    prompt_acts = _collect_probe_activations(
-        operations, runtime, prompt, settings.layers, settings.activation_source
-    )
-    full_acts = _collect_probe_activations(
-        operations, runtime, full, settings.layers, settings.activation_source
-    )
+    attention_features = {}
+    if settings.token_choice_mode == "attn_choice":
+        if operations.collect_attention_features is None:
+            raise ValueError("attn_choice requires collect_attention_features")
+        for variant, tokenized in (("prompt_tail", prompt), ("prompt_response", full)):
+            acts, scores, deepstack = operations.collect_attention_features(
+                runtime, tokenized, settings.layers, settings.use_deepstack_injection,
+            )
+            if settings.activation_source == "adapter_base_diff":
+                if operations.collect_base_activations is None:
+                    raise ValueError("adapter_base_diff requires collect_base_activations")
+                base = operations.collect_base_activations(runtime, tokenized, settings.layers)
+                acts = {layer: acts[layer] - base[layer] for layer in settings.layers}
+            attention_features[variant] = (acts, scores, deepstack)
+        prompt_acts = attention_features["prompt_tail"][0]
+        full_acts = attention_features["prompt_response"][0]
+    else:
+        prompt_acts = _collect_probe_activations(
+            operations, runtime, prompt, settings.layers, settings.activation_source
+        )
+        full_acts = _collect_probe_activations(
+            operations, runtime, full, settings.layers, settings.activation_source
+        )
     _validate_activation_map(prompt_acts, settings.layers, len(prompt.input_ids), "prompt")
     _validate_activation_map(full_acts, settings.layers, len(full.input_ids), "prompt_response")
 
@@ -318,7 +340,7 @@ def build_record_datapoints(
 
     tokenizer = operations.tokenizer(runtime)
     visual_token_ids = None
-    if settings.source_token_mode != "mixed":
+    if settings.source_token_mode != "mixed" or settings.token_choice_mode == "attn_choice":
         visual_token_ids = visual_token_ids_from_tokenizer(tokenizer)
     datapoints = []
     for layer in settings.layers:
@@ -333,18 +355,22 @@ def build_record_datapoints(
                 vectors_source = full_acts
             else:
                 raise ValueError(f"Unsupported probe variant: {variant}")
-            positions = tuple(
-                sample_modality_positions(
+            if settings.token_choice_mode == "attn_choice":
+                from nl_probes.utils.token_choice import select_attention_positions
+                positions = tuple(select_attention_positions(
+                    attention_features[variant][1][layer][0], list(source_ids), visual_token_ids,
+                    settings.token_choice_percent, mode=settings.source_token_mode, example=record.record_id,
+                ))
+            else:
+                positions = tuple(sample_modality_positions(
                     list(source_ids),
                     visual_token_ids if visual_token_ids is not None else frozenset(),
                     settings.source_token_mode,
                     len(default_positions),
                     original_positions=list(default_positions),
-                )
-            )
+                ))
             vectors = vectors_source[layer][0, list(positions), :]
-            metadata = FrozenMetadata(
-                _record_metadata(
+            metadata_dict = _record_metadata(
                     record=record,
                     registry=registry,
                     adapter=adapter,
@@ -356,7 +382,12 @@ def build_record_datapoints(
                     source_token_mode=settings.source_token_mode,
                     activation_source=settings.activation_source,
                 )
-            )
+            if settings.token_choice_mode == "attn_choice":
+                from nl_probes.utils.token_choice import selection_identity
+                metadata_dict["token_choice"] = selection_identity(
+                    settings.token_choice_mode, settings.token_choice_percent, settings.source_token_mode,
+                )
+            metadata = FrozenMetadata(metadata_dict)
             point = create_training_datapoint(
                     datapoint_type=record.family,
                     prompt=record.oracle_prompt,
@@ -368,6 +399,12 @@ def build_record_datapoints(
                     feature_idx=-1,
                     ds_label=record.oracle_target,
                     meta_info=metadata,
+                )
+            if settings.token_choice_mode == "attn_choice" and settings.use_deepstack_injection:
+                from nl_probes.utils.activation_utils import align_deepstack_to_oracle_slots
+                point.deepstack_positions, point.deepstack_steering_vectors = align_deepstack_to_oracle_slots(
+                    list(source_ids), list(positions), point.positions, visual_token_ids,
+                    attention_features[variant][2],
                 )
             datapoints.append(
                 TargetValidationDataPoint.model_validate(
@@ -642,6 +679,23 @@ def default_target_model_operations() -> TargetModelOperations:
     def disable_adapter(runtime, entry: AdapterEntry) -> None:
         runtime["model"].delete_adapter(entry.organism_id)
 
+    def collect_attention_features(runtime, tokenized, layers, use_deepstack):
+        from contextlib import ExitStack
+        from nl_probes.utils.token_choice import capture_attention_scores
+        from nl_probes.utils.activation_utils import _get_vision_module, _extract_deepstack_from_visual_output
+        features = []
+        with ExitStack() as stack:
+            if use_deepstack:
+                def visual_hook(module, args, output):
+                    features.extend(_extract_deepstack_from_visual_output(output))
+                handle = _get_vision_module(runtime["model"]).register_forward_hook(visual_hook)
+                stack.callback(handle.remove)
+            scores = stack.enter_context(capture_attention_scores(
+                runtime["model"], layers, tokenized.model_inputs["attention_mask"],
+            ))
+            acts = collect(runtime, tokenized, layers)
+        return acts, scores, [v[0].detach().cpu() if v.ndim == 3 else v.detach().cpu() for v in features]
+
     def close(runtime) -> None:
         del runtime["model"]
         del runtime["processor"]
@@ -659,4 +713,5 @@ def default_target_model_operations() -> TargetModelOperations:
         disable_adapter=disable_adapter,
         close=close,
         collect_base_activations=_collect_base_activations,
+        collect_attention_features=collect_attention_features,
     )

@@ -307,6 +307,8 @@ def eval_all_datasets(
 ) -> dict[str, float]:
     model.eval()
     eval_results = {}
+    from nl_probes.utils.token_choice import token_count_metrics
+    all_token_counts = []
     for ds in eval_datasets:
         eval_responses = run_evaluation(
             eval_data=eval_datasets[ds],
@@ -324,7 +326,12 @@ def eval_all_datasets(
             use_deepstack_injection=cfg.use_deepstack_injection,
             hook_onto_layer=cfg.hook_onto_layer,
             deepstack_coefficients=attached_deepstack_coefficients(model),
+            token_choice_mode=cfg.token_choice_mode,
+            token_choice_percent=cfg.token_choice_percent,
         )
+        counts = [response.token_counts for response in eval_responses]
+        all_token_counts.extend(counts)
+        eval_results.update(token_count_metrics(counts, ds))
         eval_results.update(
             score_eval_dataset(
                 ds,
@@ -338,6 +345,7 @@ def eval_all_datasets(
         percent_ans_correct = eval_results[f"eval_ans_correct/{ds}"]
         print(f"Step {global_step} {ds} format correct: {percent_format_correct}, ans correct: {percent_ans_correct}")
 
+    eval_results.update(token_count_metrics(all_token_counts, "all"))
     wandb.log(
         eval_results,
         step=global_step,
@@ -359,6 +367,7 @@ def oom_preflight_check(
     tokenizer: PreTrainedTokenizer,
     device: torch.device,
     dtype: torch.dtype,
+    processor=None,
 ) -> None:
     longest_prompt = max(training_data, key=lambda x: len(x.input_ids))
     long_prompts = [longest_prompt] * cfg.train_batch_size
@@ -367,6 +376,9 @@ def oom_preflight_check(
         tokenizer,
         model,
         use_deepstack_injection=cfg.use_deepstack_injection,
+        processor=processor,
+        token_choice_mode=cfg.token_choice_mode,
+        token_choice_percent=cfg.token_choice_percent,
     )
     largest_possible_batch = construct_batch(long_prompts, tokenizer, device)
 
@@ -466,7 +478,7 @@ def train_model(
 
     train_model_module.train()
 
-    oom_preflight_check(cfg, training_data, model, submodule, tokenizer, device, dtype)
+    oom_preflight_check(cfg, training_data, model, submodule, tokenizer, device, dtype, processor)
 
     set_seed(cfg.seed)
 
@@ -574,6 +586,8 @@ def train_model(
                 model,
                 processor=processor,
                 use_deepstack_injection=cfg.use_deepstack_injection,
+                token_choice_mode=cfg.token_choice_mode,
+                token_choice_percent=cfg.token_choice_percent,
             )
 
             t_batch = construct_batch(t_batch_list, tokenizer, device)
@@ -799,6 +813,9 @@ def build_target_validation_datasets(
         layers=layers,
         source_token_mode=source_token_mode,
         activation_source=target_activation_source,
+        token_choice_mode=dataset_flags.token_choice_mode,
+        token_choice_percent=dataset_flags.token_choice_percent,
+        use_deepstack_injection=(dataset_flags.deepstack_injection and dataset_flags.token_choice_mode == "attn_choice"),
     )
     cache_dir = Path(dataset_flags.target_cache_dir)
     ready_path = cache_dir / (
@@ -1442,6 +1459,8 @@ if __name__ == "__main__":
                 use_deepstack_injection=dataset_flags.deepstack_injection,
                 train_deepstack_coefficients=dataset_flags.train_deepstack_coefficients,
                 deepstack_coefficient_init=dataset_flags.deepstack_coefficient_init,
+                token_choice_mode=dataset_flags.token_choice_mode,
+                token_choice_percent=dataset_flags.token_choice_percent,
                 run_id=run_id,
             )
             cfg_kwargs.update(hyperparam_override)

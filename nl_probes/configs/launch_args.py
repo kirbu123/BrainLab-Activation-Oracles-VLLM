@@ -4,6 +4,21 @@ import argparse
 from dataclasses import asdict, dataclass
 
 
+def _add_token_choice_args(parser):
+    parser.add_argument("--token-choice-mode", choices=("default", "attn_choice"), default="default")
+    parser.add_argument("--token-choice-percent", type=float, default=None,
+                        help="Percentage of eligible source tokens; required for attn_choice")
+
+
+def _validate_token_choice_flags(flags):
+    if flags.token_choice_mode == "default" and flags.token_choice_percent is not None:
+        raise ValueError("--token-choice-percent requires --token-choice-mode attn_choice")
+    if flags.token_choice_mode == "attn_choice" and (
+        flags.token_choice_percent is None or not 0 < flags.token_choice_percent <= 100
+    ):
+        raise ValueError("attn_choice requires --token-choice-percent in (0, 100]")
+
+
 def _add_deepstack_injection_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--deepstack-injection",
@@ -58,6 +73,8 @@ class DatasetFamilyFlags:
     train_deepstack_coefficients: bool = False
     deepstack_coefficient_init: float = 1.0
     eval_steps: int = 2000
+    token_choice_mode: str = "default"
+    token_choice_percent: float | None = None
     target_adapter_registry: str = "data/val/target_organisms/adapter_registry.json"
     target_val_root: str = "data/val"
     target_cache_dir: str = "data/val/cache"
@@ -72,6 +89,7 @@ class DatasetFamilyFlags:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the vision-language Activation Oracle")
+    _add_token_choice_args(parser)
     parser.add_argument(
         "--eval-steps",
         type=int,
@@ -141,6 +159,7 @@ def build_eval_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Evaluate a trained vision-language Activation Oracle"
     )
+    _add_token_choice_args(parser)
     parser.add_argument("--lora-path", required=True, help="Path to the trained oracle LoRA")
     parser.add_argument(
         "--source-tokens",
@@ -213,6 +232,8 @@ def parse_eval_launch_args(argv: list[str] | None = None) -> OracleModalityEvalA
     namespace = build_eval_parser().parse_args(argv)
     flags = DatasetFamilyFlags(
         visual_spqa=False,
+        token_choice_mode=namespace.token_choice_mode,
+        token_choice_percent=namespace.token_choice_percent,
         classification=namespace.classification,
         context_prediction=namespace.context_prediction,
         snli_ve=namespace.snli_ve,
@@ -240,6 +261,7 @@ def parse_eval_launch_args(argv: list[str] | None = None) -> OracleModalityEvalA
 
 
 def validate_eval_family_flags(flags: DatasetFamilyFlags) -> None:
+    _validate_token_choice_flags(flags)
     if not validation_enabled(flags):
         raise ValueError(
             "No validation datasets selected. Enable at least one of "
@@ -252,6 +274,8 @@ def parse_launch_args(argv: list[str] | None = None) -> DatasetFamilyFlags:
     namespace = build_parser().parse_args(argv)
     flags = DatasetFamilyFlags(
         visual_spqa=namespace.visual_spqa,
+        token_choice_mode=namespace.token_choice_mode,
+        token_choice_percent=namespace.token_choice_percent,
         eval_steps=namespace.eval_steps,
         deepstack_coefficient_init=namespace.deepstack_coefficient_init,
         classification=namespace.classification,
@@ -273,6 +297,7 @@ def parse_launch_args(argv: list[str] | None = None) -> DatasetFamilyFlags:
 
 
 def validate_family_flags(flags: DatasetFamilyFlags) -> None:
+    _validate_token_choice_flags(flags)
     if flags.eval_steps <= 0:
         raise ValueError("--eval-steps must be a positive integer")
     if not (flags.visual_spqa or flags.classification or flags.context_prediction):
@@ -292,6 +317,8 @@ def _validate_deepstack_coefficient_flags(flags: DatasetFamilyFlags) -> None:
 
 def enabled_family_tokens(flags: DatasetFamilyFlags) -> list[str]:
     tokens = []
+    if flags.token_choice_mode == "attn_choice":
+        tokens.append(f"attn{flags.token_choice_percent:g}")
     if flags.visual_spqa:
         tokens.append("visual_spqa")
     if flags.classification:
