@@ -214,8 +214,9 @@ def collect_deepstack_features(model: torch.nn.Module, inputs_BL: dict[str, torc
     if "image_grid_thw" not in inputs_BL:
         raise ValueError("DeepStack collection requires image_grid_thw")
     visual = _get_vision_module(model)
-    pixel_values = inputs_BL["pixel_values"]
-    grid_thw = inputs_BL["image_grid_thw"]
+    vision_param = next(visual.parameters())
+    pixel_values = inputs_BL["pixel_values"].to(device=vision_param.device, dtype=vision_param.dtype)
+    grid_thw = inputs_BL["image_grid_thw"].to(device=vision_param.device)
     with torch.no_grad():
         output = visual(pixel_values, grid_thw=grid_thw)
     features = _extract_deepstack_from_visual_output(output)

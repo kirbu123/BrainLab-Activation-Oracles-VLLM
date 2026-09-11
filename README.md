@@ -228,6 +228,9 @@ Ties prefer earlier source positions; empty eligible pools fail explicitly.
 DeepStack uses only the visual subset of the selected positions. Collection
 temporarily uses eager decoder attention, which has quadratic attention-map
 memory cost; the normal backend is restored before oracle training/generation.
+Attention-mode DeepStack collection uses an explicit extra vision forward with
+image tensors matched to the vision tower's dtype/device, independent of hooks
+on the decoder collection path.
 Standard dataset caches remain source records: attention mode replaces their
 default vectors during materialization and reuses selected validation vectors
 in memory. Target-adapter attention caches have distinct versioned identities.

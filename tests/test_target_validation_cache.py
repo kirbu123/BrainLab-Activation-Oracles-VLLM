@@ -16,6 +16,54 @@ from nl_probes.dataset_classes.target_organisms import (
 )
 
 
+@pytest.mark.parametrize("use_deepstack", [False, True])
+def test_real_target_collector_explicitly_runs_vision(monkeypatch, use_deepstack):
+    from contextlib import contextmanager
+    from nl_probes.dataset_classes.target_organisms.cache import default_target_model_operations
+    from nl_probes.utils import activation_utils, token_choice
+
+    class Vision(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1, dtype=torch.float64))
+            self.calls = 0
+
+        def forward(self, pixels, grid_thw):
+            self.calls += 1
+            assert pixels.dtype == self.weight.dtype
+            assert pixels.device == grid_thw.device == self.weight.device
+            assert not torch.is_grad_enabled()
+            return pixels, [torch.ones(2, 4, dtype=pixels.dtype)]
+
+    model = torch.nn.Module()
+    model.visual = Vision()
+    scores = {1: torch.ones(1, 4)}
+
+    @contextmanager
+    def capture(*args):
+        yield scores
+
+    monkeypatch.setattr(token_choice, "capture_attention_scores", capture)
+    monkeypatch.setattr(activation_utils, "get_hf_submodule", lambda *args, **kwargs: model)
+    # Decoder collection deliberately never calls the vision module.
+    monkeypatch.setattr(activation_utils, "collect_activations_multiple_layers",
+                        lambda **kwargs: {1: torch.ones(1, 4, 4)})
+    ops = default_target_model_operations()
+    inputs = {"input_ids": torch.tensor([[7, 7, 1, 2]]), "attention_mask": torch.ones(1, 4),
+              "pixel_values": torch.ones(2, 4, dtype=torch.float32), "image_grid_thw": torch.tensor([[1, 1, 2]])}
+    acts, actual_scores, features = ops.collect_attention_features(
+        {"model": model}, TokenizedTarget((7, 7, 1, 2), inputs), (1,), use_deepstack,
+    )
+    assert actual_scores is scores
+    assert acts[1].shape == (1, 4, 4)
+    assert model.visual.calls == int(use_deepstack)
+    assert len(features) == int(use_deepstack)
+    if use_deepstack:
+        assert features[0].shape == (2, 4)
+        assert not features[0].requires_grad
+    assert inputs["pixel_values"].dtype == torch.float32
+
+
 class FakeOracleTokenizer:
     def encode(self, value, add_special_tokens=False):
         assert value == " ?"

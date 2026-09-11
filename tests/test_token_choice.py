@@ -138,7 +138,8 @@ def test_zero_initialized_coefficient_receives_gradient():
 
 
 @pytest.mark.parametrize("dataset", ["coco_captions_past_lens", "visual_spqa"])
-def test_tiny_qwen_attention_materializes_new_slots_and_preserves_default(monkeypatch, dataset):
+@pytest.mark.parametrize("use_deepstack", [False, True])
+def test_tiny_qwen_attention_materializes_new_slots_and_preserves_default(monkeypatch, dataset, use_deepstack):
     from contextlib import nullcontext
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
@@ -191,14 +192,30 @@ def test_tiny_qwen_attention_materializes_new_slots_and_preserves_default(monkey
     else:
         metadata = {"target_positions": [4, 5]}
         expected = [0, 1, 2, 3]
+    vision_calls = []
+    if use_deepstack:
+        metadata.setdefault("target_messages", [])
+        monkeypatch.setattr("nl_probes.utils.vlm_utils.vlm_tokenize_target", lambda *args, **kwargs: (
+            ids, {"input_ids": torch.tensor([ids]), "attention_mask": torch.ones(1, len(ids), dtype=torch.long)},
+        ))
+
+        def collect_vision(actual_model, inputs):
+            assert actual_model is model
+            assert not model.training
+            vision_calls.append(1)
+            return [torch.ones(2, 16)]
+
+        monkeypatch.setattr("nl_probes.utils.activation_utils.collect_deepstack_features", collect_vision)
     point = create_training_datapoint(
         dataset, "Predict text", "answer", 1, 1, tokenizer,
         torch.ones(1, 16), -1, context_input_ids=ids, context_positions=[3],
         meta_info=metadata,
+        context_image_paths=["unused.png"] if use_deepstack else None,
     )
     assert materialize_missing_steering_vectors([point], tokenizer, model)[0] is point
     changed = materialize_missing_steering_vectors(
         [point], tokenizer, model, token_choice_mode="attn_choice", token_choice_percent=100,
+        use_deepstack_injection=use_deepstack,
     )[0]
     assert changed.context_positions == expected
     assert len(changed.positions) == 4
@@ -206,6 +223,9 @@ def test_tiny_qwen_attention_materializes_new_slots_and_preserves_default(monkey
     assert point.context_positions == [3]
     assert model.training
     assert config._attn_implementation == "sdpa"
+    assert len(vision_calls) == int(use_deepstack)
+    if use_deepstack:
+        assert len(changed.deepstack_positions) == sum(ids[i] == 7 for i in expected)
     assert materialize_missing_steering_vectors(
         [changed], tokenizer, model, token_choice_mode="attn_choice", token_choice_percent=100,
     )[0] is changed

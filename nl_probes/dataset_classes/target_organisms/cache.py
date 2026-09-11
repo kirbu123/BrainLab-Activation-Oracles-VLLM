@@ -680,20 +680,15 @@ def default_target_model_operations() -> TargetModelOperations:
         runtime["model"].delete_adapter(entry.organism_id)
 
     def collect_attention_features(runtime, tokenized, layers, use_deepstack):
-        from contextlib import ExitStack
         from nl_probes.utils.token_choice import capture_attention_scores
-        from nl_probes.utils.activation_utils import _get_vision_module, _extract_deepstack_from_visual_output
+        from nl_probes.utils.activation_utils import collect_deepstack_features
         features = []
-        with ExitStack() as stack:
-            if use_deepstack:
-                def visual_hook(module, args, output):
-                    features.extend(_extract_deepstack_from_visual_output(output))
-                handle = _get_vision_module(runtime["model"]).register_forward_hook(visual_hook)
-                stack.callback(handle.remove)
-            scores = stack.enter_context(capture_attention_scores(
+        with capture_attention_scores(
                 runtime["model"], layers, tokenized.model_inputs["attention_mask"],
-            ))
+        ) as scores:
             acts = collect(runtime, tokenized, layers)
+            if use_deepstack:
+                features = collect_deepstack_features(runtime["model"], dict(tokenized.model_inputs))
         return acts, scores, [v[0].detach().cpu() if v.ndim == 3 else v.detach().cpu() for v in features]
 
     def close(runtime) -> None:

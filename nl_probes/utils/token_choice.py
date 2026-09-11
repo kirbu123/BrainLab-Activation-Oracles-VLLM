@@ -119,7 +119,7 @@ def token_count_record(point, visual_ids, deepstack_layers=0):
 
 def materialize_attention_choices(points, tokenizer, model, processor, percent, use_deepstack, source_mode):
     from nl_probes.utils.activation_utils import (
-        _get_vision_module, _extract_deepstack_from_visual_output,
+        collect_deepstack_features,
         align_deepstack_to_oracle_slots, collect_activations_multiple_layers, get_hf_submodule,
     )
     from nl_probes.utils.dataset_utils import (
@@ -160,15 +160,12 @@ def materialize_attention_choices(points, tokenizer, model, processor, percent, 
         ds_features = []
         with contextlib.ExitStack() as stack:
             stack.enter_context(model.disable_adapter())
-            if use_deepstack and point.context_image_paths:
-                def capture_visual(module, args, output):
-                    ds_features.extend(_extract_deepstack_from_visual_output(output))
-                handle = _get_vision_module(model).register_forward_hook(capture_visual)
-                stack.callback(handle.remove)
             scores = stack.enter_context(capture_attention_scores(model, [point.layer], inputs["attention_mask"]))
             acts = collect_activations_multiple_layers(
                 model, {point.layer: get_hf_submodule(model, point.layer, use_lora=True)}, inputs, None, None,
             )
+            if use_deepstack and point.context_image_paths:
+                ds_features = collect_deepstack_features(model, inputs)
         positions = select_attention_positions(
             scores[point.layer][0], ids, visual_ids, percent, excluded=excluded,
             mode=source_mode, example=point.datapoint_type,
