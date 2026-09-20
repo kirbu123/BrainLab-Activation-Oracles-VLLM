@@ -22,6 +22,50 @@ def test_dataset_families_are_enabled_by_default():
     assert not flags.visual_personaqa_val
 
 
+def test_num_epochs_and_injection_layers_defaults():
+    flags = parse_launch_args([])
+    assert flags.num_epochs == 1
+    assert flags.num_injection_layers == 1
+    assert "num_epochs" not in flags.as_dict()
+    assert "num_injection_layers" not in flags.as_dict()
+
+
+def test_num_epochs_override():
+    flags = parse_launch_args(["--num-epochs", "3"])
+    assert flags.num_epochs == 3
+    assert flags.num_injection_layers == 1
+    assert "ep3" in enabled_family_tokens(flags)
+
+
+def test_num_injection_layers_override_train_and_eval():
+    flags = parse_launch_args(["--num-injection-layers", "3"])
+    assert flags.num_injection_layers == 3
+    assert flags.num_epochs == 1
+    assert "inj3" in enabled_family_tokens(flags)
+
+    eval_args = parse_eval_launch_args(
+        ["--lora-path", "logs/run/checkpoints/final", "--num-injection-layers", "3"]
+    )
+    assert eval_args.dataset_flags.num_injection_layers == 3
+    assert eval_args.dataset_flags.num_epochs == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_num_epochs_must_be_positive(value):
+    with pytest.raises(ValueError, match="--num-epochs must be a positive integer"):
+        parse_launch_args(["--num-epochs", value])
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_num_injection_layers_must_be_positive(value):
+    with pytest.raises(ValueError, match="--num-injection-layers must be a positive integer"):
+        parse_launch_args(["--num-injection-layers", value])
+    with pytest.raises(ValueError, match="--num-injection-layers must be a positive integer"):
+        parse_eval_launch_args(
+            ["--lora-path", "logs/run/checkpoints/final", "--num-injection-layers", value]
+        )
+
+
 def test_eval_steps_default_and_override():
     assert parse_launch_args([]).eval_steps == 2000
     flags = parse_launch_args(["--eval-steps", "5000"])

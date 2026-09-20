@@ -129,6 +129,7 @@ def main() -> None:
     layer_percents = [25, 50, 75]
     eval_batch_size = 16
     hook_layer = 1
+    num_injection_layers = args.dataset_flags.num_injection_layers
     model_kwargs = {"device_map": {"": f"cuda:{local_rank}"}}
 
     loaders = build_vlm_eval_loaders(
@@ -137,6 +138,7 @@ def main() -> None:
         layer_percents=layer_percents,
         eval_batch_size=eval_batch_size,
         model_kwargs={},
+        num_injection_layers=num_injection_layers,
     )
     wandb_suffix = (
         f"_modality_eval_{'_'.join(args.source_tokens)}"
@@ -145,6 +147,7 @@ def main() -> None:
     cfg = SelfInterpTrainingConfig(
         model_name=model_name,
         hook_onto_layer=hook_layer,
+        num_injection_layers=num_injection_layers,
         layer_percents=layer_percents,
         eval_batch_size=eval_batch_size,
         dataset_families=args.dataset_flags.as_dict(),
@@ -239,6 +242,7 @@ def main() -> None:
                     processor=processor,
                     use_deepstack_injection=cfg.use_deepstack_injection,
                     hook_onto_layer=cfg.hook_onto_layer,
+                    hook_onto_layers=cfg.hook_onto_layers,
                     deepstack_coefficients=attached_deepstack_coefficients(model),
                     token_choice_mode=cfg.token_choice_mode,
                     token_choice_percent=cfg.token_choice_percent,

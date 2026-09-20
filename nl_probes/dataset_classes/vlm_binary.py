@@ -16,7 +16,11 @@ from nl_probes.dataset_classes.act_dataset_manager import (
 )
 from nl_probes.utils.activation_utils import collect_activations_multiple_layers, get_hf_submodule
 from nl_probes.utils.common import layer_percent_to_layer, load_model, load_processor, load_tokenizer, set_seed
-from nl_probes.utils.dataset_utils import TrainingDataPoint, create_training_datapoint
+from nl_probes.utils.dataset_utils import (
+    TrainingDataPoint,
+    create_training_datapoint,
+    sample_source_layer_assignments,
+)
 from nl_probes.utils.vlm_utils import DEFAULT_MAX_PIXELS, extract_image_paths, vision_inputs_to_device, vlm_tokenize_target
 
 YES_TOKEN = "Yes"
@@ -171,6 +175,7 @@ class VLMBinaryDatasetLoader(ActDatasetLoader):
                 batch_size=max(1, self.dataset_config.batch_size),
                 model_kwargs=self.model_kwargs,
                 rng=rng,
+                num_injection_layers=self.dataset_config.num_injection_layers,
             )
             self.save_dataset(data, split)
 
@@ -201,6 +206,7 @@ def create_vlm_binary_vector_dataset(
     batch_size: int,
     model_kwargs: dict[str, Any],
     rng: random.Random,
+    num_injection_layers: int = 1,
 ) -> list[TrainingDataPoint]:
     """Convert normalized records into activation-oracle datapoints."""
 
@@ -241,7 +247,6 @@ def create_vlm_binary_vector_dataset(
             positions = sample_context_positions(len(context_input_ids), dataset_params, rng)
 
             acts_by_layer = None
-            layers_for_record = act_layers if save_acts else [rng.choice(act_layers)]
             if save_acts:
                 inputs = vision_inputs_to_device(proc_inputs, device)
                 with torch.no_grad():
@@ -252,11 +257,19 @@ def create_vlm_binary_vector_dataset(
                         None,
                         None,
                     )
+            assignments = sample_source_layer_assignments(
+                act_layers, num_injection_layers, rng, exhaust_single=save_acts
+            )
 
-            for layer in layers_for_record:
+            for source_layers in assignments:
+                dest_acts = None
                 acts = None
                 if save_acts:
-                    acts = acts_by_layer[layer][0, positions].detach().contiguous()
+                    dest_acts = [
+                        acts_by_layer[layer][0, positions].detach().contiguous()
+                        for layer in source_layers
+                    ]
+                    acts = dest_acts[0]
                 metadata = {
                     "target_messages": messages,
                     "add_generation_prompt": True,
@@ -268,7 +281,7 @@ def create_vlm_binary_vector_dataset(
                         datapoint_type=datapoint_type,
                         prompt=record.question,
                         target_response=record.answer,
-                        layer=layer,
+                        layer=source_layers[0],
                         num_positions=len(positions),
                         tokenizer=tokenizer,
                         acts_BD=acts,
@@ -278,6 +291,8 @@ def create_vlm_binary_vector_dataset(
                         context_image_paths=extract_image_paths(messages),
                         ds_label=record.answer,
                         meta_info=metadata,
+                        source_layers=source_layers,
+                        dest_acts=dest_acts if dest_acts is not None and len(source_layers) > 1 else None,
                     )
                 )
     return training_data

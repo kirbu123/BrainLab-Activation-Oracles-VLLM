@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import random
 import re
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
@@ -32,7 +33,11 @@ from nl_probes.dataset_classes.target_organisms.schema import (
     checksum_json,
     checksum_path,
 )
-from nl_probes.utils.dataset_utils import TrainingDataPoint, create_training_datapoint
+from nl_probes.utils.dataset_utils import (
+    TrainingDataPoint,
+    create_training_datapoint,
+    sample_source_layer_assignments,
+)
 from nl_probes.utils.vlm_utils import sample_modality_positions, visual_token_ids_from_tokenizer
 
 
@@ -345,7 +350,14 @@ def build_record_datapoints(
     if settings.source_token_mode != "mixed" or settings.token_choice_mode == "attn_choice":
         visual_token_ids = visual_token_ids_from_tokenizer(tokenizer)
     datapoints = []
-    for layer in settings.layers:
+    rng = random.Random(record.record_id)
+    assignments = sample_source_layer_assignments(
+        settings.layers,
+        settings.num_injection_layers,
+        rng,
+        exhaust_single=settings.num_injection_layers == 1,
+    )
+    for source_layers in assignments:
         for variant in settings.variants:
             if variant == "prompt_tail":
                 source_ids = prompt.input_ids
@@ -360,7 +372,7 @@ def build_record_datapoints(
             if settings.token_choice_mode == "attn_choice":
                 from nl_probes.utils.token_choice import select_attention_positions
                 positions = tuple(select_attention_positions(
-                    attention_features[variant][1][layer][0], list(source_ids), visual_token_ids,
+                    attention_features[variant][1][source_layers[0]][0], list(source_ids), visual_token_ids,
                     settings.token_choice_percent, mode=settings.source_token_mode, example=record.record_id,
                 ))
             else:
@@ -371,7 +383,10 @@ def build_record_datapoints(
                     len(default_positions),
                     original_positions=list(default_positions),
                 ))
-            vectors = vectors_source[layer][0, list(positions), :]
+            dest_acts = [
+                vectors_source[layer][0, list(positions), :].detach().to(device="cpu").contiguous()
+                for layer in source_layers
+            ]
             metadata_dict = _record_metadata(
                     record=record,
                     registry=registry,
@@ -394,13 +409,15 @@ def build_record_datapoints(
                     datapoint_type=record.family,
                     prompt=record.oracle_prompt,
                     target_response=record.oracle_target,
-                    layer=layer,
+                    layer=source_layers[0],
                     num_positions=len(positions),
                     tokenizer=tokenizer,
-                    acts_BD=vectors.detach().to(device="cpu").contiguous(),
+                    acts_BD=dest_acts[0],
                     feature_idx=-1,
                     ds_label=record.oracle_target,
                     meta_info=metadata,
+                    source_layers=list(source_layers),
+                    dest_acts=dest_acts if len(source_layers) > 1 else None,
                 )
             if settings.token_choice_mode == "attn_choice" and settings.use_deepstack_injection:
                 from nl_probes.utils.activation_utils import align_deepstack_to_oracle_slots

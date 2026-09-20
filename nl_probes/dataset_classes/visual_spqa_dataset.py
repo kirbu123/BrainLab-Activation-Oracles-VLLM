@@ -17,7 +17,11 @@ from nl_probes.dataset_classes.act_dataset_manager import (
     DatasetLoaderConfig,
 )
 from nl_probes.utils.common import layer_percent_to_layer, load_processor, load_tokenizer
-from nl_probes.utils.dataset_utils import TrainingDataPoint, create_training_datapoint
+from nl_probes.utils.dataset_utils import (
+    TrainingDataPoint,
+    create_training_datapoint,
+    sample_source_layer_assignments,
+)
 from nl_probes.utils.vlm_utils import DEFAULT_MAX_PIXELS, extract_image_paths, vlm_tokenize_target
 
 IMAGE_TOKEN_RE = re.compile(r"\s*<image>\s*", re.IGNORECASE)
@@ -97,6 +101,7 @@ class VisualSPQADatasetLoader(ActDatasetLoader):
                     act_layers=layers,
                     dataset_params=self.dataset_params,
                     rng=rng,
+                    num_injection_layers=self.dataset_config.num_injection_layers,
                 )
             except Exception as exc:
                 skipped += 1
@@ -275,6 +280,7 @@ def create_visual_spqa_datapoint(
     act_layers: list[int],
     dataset_params: VisualSPQADatasetConfig,
     rng: random.Random,
+    num_injection_layers: int = 1,
 ) -> TrainingDataPoint:
     include_assistant = bool(llava.get("gpt")) and rng.random() < dataset_params.include_assistant_prob
     messages: list[dict] = [
@@ -304,13 +310,16 @@ def create_visual_spqa_datapoint(
     system_len = min(_system_prefix_len(processor, overlay["instruction"]), len(context_input_ids) - 1)
     unmasked = list(range(system_len, len(context_input_ids)))
     context_positions = sample_unmasked_positions(unmasked, dataset_params, rng)
-    layer = rng.choice(act_layers)
+    source_layers = sample_source_layer_assignments(
+        act_layers, num_injection_layers, rng, exhaust_single=False
+    )[0]
 
     return create_training_datapoint(
         datapoint_type="visual_spqa",
         prompt=overlay["question"],
         target_response=overlay["answer"],
-        layer=layer,
+        layer=source_layers[0],
+        source_layers=source_layers,
         num_positions=len(context_positions),
         tokenizer=tokenizer,
         acts_BD=None,

@@ -34,6 +34,24 @@ def _add_deepstack_injection_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_injection_layers_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--num-injection-layers",
+        type=int,
+        default=1,
+        help="Write +h into language decoder layers 1..N (default: 1)",
+    )
+
+
+def _add_num_epochs_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--num-epochs",
+        type=int,
+        default=1,
+        help="Number of training epochs (default: 1)",
+    )
+
+
 def _add_target_data_root_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--target-adapter-registry",
@@ -78,6 +96,8 @@ class DatasetFamilyFlags:
     target_adapter_registry: str = "data/val/target_organisms/adapter_registry.json"
     target_val_root: str = "data/val"
     target_cache_dir: str = "data/val/cache"
+    num_injection_layers: int = 1
+    num_epochs: int = 1
 
     def as_dict(self) -> dict[str, bool]:
         return {
@@ -96,6 +116,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=2000,
         help="Optimizer-step interval between validations (default: 2000); final validation always runs when enabled",
     )
+    _add_num_epochs_arg(parser)
+    _add_injection_layers_arg(parser)
     parser.add_argument(
         "--deepstack-coefficient-init",
         type=float,
@@ -160,6 +182,7 @@ def build_eval_parser() -> argparse.ArgumentParser:
         description="Evaluate a trained vision-language Activation Oracle"
     )
     _add_token_choice_args(parser)
+    _add_injection_layers_arg(parser)
     parser.add_argument("--lora-path", required=True, help="Path to the trained oracle LoRA")
     parser.add_argument(
         "--source-tokens",
@@ -247,6 +270,7 @@ def parse_eval_launch_args(argv: list[str] | None = None) -> OracleModalityEvalA
         target_adapter_registry=namespace.target_adapter_registry,
         target_val_root=namespace.target_val_root,
         target_cache_dir=namespace.target_cache_dir,
+        num_injection_layers=namespace.num_injection_layers,
     )
     validate_eval_family_flags(flags)
     modes = tuple(dict.fromkeys(namespace.source_tokens))
@@ -262,6 +286,7 @@ def parse_eval_launch_args(argv: list[str] | None = None) -> OracleModalityEvalA
 
 def validate_eval_family_flags(flags: DatasetFamilyFlags) -> None:
     _validate_token_choice_flags(flags)
+    _validate_injection_layer_flags(flags)
     if not validation_enabled(flags):
         raise ValueError(
             "No validation datasets selected. Enable at least one of "
@@ -291,6 +316,8 @@ def parse_launch_args(argv: list[str] | None = None) -> DatasetFamilyFlags:
         target_adapter_registry=namespace.target_adapter_registry,
         target_val_root=namespace.target_val_root,
         target_cache_dir=namespace.target_cache_dir,
+        num_injection_layers=namespace.num_injection_layers,
+        num_epochs=namespace.num_epochs,
     )
     validate_family_flags(flags)
     return flags
@@ -298,6 +325,9 @@ def parse_launch_args(argv: list[str] | None = None) -> DatasetFamilyFlags:
 
 def validate_family_flags(flags: DatasetFamilyFlags) -> None:
     _validate_token_choice_flags(flags)
+    _validate_injection_layer_flags(flags)
+    if flags.num_epochs < 1:
+        raise ValueError("--num-epochs must be a positive integer")
     if flags.eval_steps <= 0:
         raise ValueError("--eval-steps must be a positive integer")
     if not (flags.visual_spqa or flags.classification or flags.context_prediction):
@@ -306,6 +336,11 @@ def validate_family_flags(flags: DatasetFamilyFlags) -> None:
             "--visual-spqa, --classification, or --context-prediction."
         )
     _validate_deepstack_coefficient_flags(flags)
+
+
+def _validate_injection_layer_flags(flags: DatasetFamilyFlags) -> None:
+    if flags.num_injection_layers < 1:
+        raise ValueError("--num-injection-layers must be a positive integer")
 
 
 def _validate_deepstack_coefficient_flags(flags: DatasetFamilyFlags) -> None:
@@ -341,6 +376,10 @@ def enabled_family_tokens(flags: DatasetFamilyFlags) -> list[str]:
         tokens.append("deepstack")
     if flags.train_deepstack_coefficients:
         tokens.append("dscoef")
+    if flags.num_injection_layers != 1:
+        tokens.append(f"inj{flags.num_injection_layers}")
+    if flags.num_epochs != 1:
+        tokens.append(f"ep{flags.num_epochs}")
     return tokens
 
 

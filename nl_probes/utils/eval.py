@@ -31,6 +31,7 @@ def eval_features_batch(
     generation_kwargs: dict,
     use_deepstack_injection: bool = False,
     hook_onto_layer: int = 1,
+    hook_onto_layers: list[int] | None = None,
     deepstack_coefficients: torch.Tensor | None = None,
 ) -> list[FeatureResult]:
     batch_steering_vectors = eval_batch.steering_vectors
@@ -56,6 +57,8 @@ def eval_features_batch(
         dtype=dtype,
         use_deepstack_injection=use_deepstack_injection,
         hook_onto_layer=hook_onto_layer,
+        hook_onto_layers=hook_onto_layers,
+        dest_steering_vectors=eval_batch.dest_steering_vectors,
         deepstack_steering_vectors=eval_batch.deepstack_steering_vectors,
         deepstack_positions=eval_batch.deepstack_positions,
         deepstack_coefficients=deepstack_coefficients,
@@ -121,6 +124,7 @@ def run_evaluation(
     processor=None,
     use_deepstack_injection: bool = False,
     hook_onto_layer: int = 1,
+    hook_onto_layers: list[int] | None = None,
     deepstack_coefficients: torch.Tensor | None = None,
     token_choice_mode: str = "default",
     token_choice_percent: float | None = None,
@@ -175,6 +179,7 @@ def run_evaluation(
                 generation_kwargs=generation_kwargs,
                 use_deepstack_injection=use_deepstack_injection,
                 hook_onto_layer=hook_onto_layer,
+                hook_onto_layers=hook_onto_layers,
                 deepstack_coefficients=deepstack_coefficients,
             )
             if verbose:

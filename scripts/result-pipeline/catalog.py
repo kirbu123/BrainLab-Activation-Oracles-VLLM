@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class CatalogRun:
+    """directory and overlay are names under the logs root, not host paths."""
+
     name: str
     color: str
     description: str

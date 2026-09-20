@@ -226,7 +226,7 @@ function renderAll(){
 }
 document.getElementById("legend").innerHTML=runs.map((r,i)=>'<label>'+swatch(r)+'<input type="checkbox" id="run-'+i+'" checked>'+esc(r.name)+'</label>').join("");
 document.getElementById("legend").addEventListener("change",renderAll);
-document.getElementById("descriptions").innerHTML=runs.map(r=>'<article class="description"><h3>'+swatch(r)+esc(r.name)+'</h3><p>'+esc(r.description)+'</p><p class="caption"><code>'+esc(r.directory)+'</code></p><a href="../'+encodeURIComponent(r.directory)+'/results.html">Training report</a> · <a href="../'+encodeURIComponent(r.directory)+'/results.json">Recorded training metrics</a></article>').join("");
+document.getElementById("descriptions").innerHTML=runs.map(r=>'<article class="description"><h3>'+swatch(r)+esc(r.name)+'</h3><p>'+esc(r.description)+'</p><p class="caption"><code>'+esc(r.directory)+'</code></p><a href="'+esc(r.html_href)+'">Training report</a> · <a href="'+esc(r.json_href)+'">Recorded training metrics</a></article>').join("");
 renderAll();
 const tooltip=document.getElementById("tooltip");
 document.addEventListener("pointermove",event=>{const target=event.target.closest("[data-tip]");if(!target){tooltip.style.display="none";return;}tooltip.textContent=target.dataset.tip;tooltip.style.display="block";tooltip.style.left=Math.max(8,Math.min(event.clientX+12,window.innerWidth-tooltip.offsetWidth-8))+"px";tooltip.style.top=Math.max(8,Math.min(event.clientY+12,window.innerHeight-tooltip.offsetHeight-8))+"px";});

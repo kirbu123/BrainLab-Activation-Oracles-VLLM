@@ -277,6 +277,7 @@ class ProbeSettings(StrictModel):
     generate_target_response: bool = True
     source_token_mode: SourceTokenMode = "mixed"
     activation_source: ActivationSource = "target_lora"
+    num_injection_layers: int = Field(default=1, ge=1)
 
     @field_validator("layers")
     @classmethod

@@ -375,6 +375,48 @@ def _unwrap_forward_model(model: torch.nn.Module) -> torch.nn.Module:
     return inner
 
 
+def _per_dest_decoder_vectors(
+    dest_layers: list[int],
+    batch_steering_vectors: list[torch.Tensor],
+    dest_steering_vectors: list[list[torch.Tensor]] | None,
+) -> list[list[torch.Tensor]]:
+    if dest_steering_vectors:
+        n_dest = len(dest_layers)
+        if all(not item_vectors for item_vectors in dest_steering_vectors):
+            if n_dest != 1:
+                raise ValueError("Multiple dest layers require dest_steering_vectors")
+            return [batch_steering_vectors]
+        per_dest: list[list[torch.Tensor]] = []
+        for dest_idx in range(n_dest):
+            dest_vecs = []
+            for item_idx, item_vectors in enumerate(dest_steering_vectors):
+                if not item_vectors:
+                    raise ValueError(f"dest_steering_vectors[{item_idx}] is empty")
+                if dest_idx >= len(item_vectors):
+                    raise ValueError(
+                        f"dest_steering_vectors[{item_idx}] has {len(item_vectors)} dests, expected {n_dest}"
+                    )
+                dest_vecs.append(item_vectors[dest_idx])
+            per_dest.append(dest_vecs)
+        return per_dest
+    if len(dest_layers) != 1:
+        raise ValueError("Multiple dest layers require dest_steering_vectors")
+    return [batch_steering_vectors]
+
+
+def _dest_module(
+    model: torch.nn.Module,
+    decoder_submodule: torch.nn.Module,
+    dest_idx: int,
+    dest_layer: int,
+) -> torch.nn.Module:
+    if dest_idx == 0:
+        return decoder_submodule
+    from nl_probes.utils.activation_utils import get_hf_submodule
+
+    return get_hf_submodule(_unwrap_forward_model(model), dest_layer)
+
+
 @contextlib.contextmanager
 def oracle_steering_hooks(
     model: torch.nn.Module,
@@ -386,6 +428,8 @@ def oracle_steering_hooks(
     dtype: torch.dtype,
     use_deepstack_injection: bool = False,
     hook_onto_layer: int = 1,
+    hook_onto_layers: list[int] | None = None,
+    dest_steering_vectors: list[list[torch.Tensor]] | None = None,
     deepstack_steering_vectors: list[list[torch.Tensor]] | None = None,
     deepstack_positions: list[list[int]] | None = None,
     deepstack_coefficients: torch.Tensor | None = None,
@@ -393,16 +437,37 @@ def oracle_steering_hooks(
     """Register decoder-act and optional DeepStack encoder steering hooks."""
     from nl_probes.utils.activation_utils import get_hf_submodule
 
-    decoder_hook = get_hf_activation_steering_hook(
-        vectors=batch_steering_vectors,
-        positions=batch_positions,
-        steering_coefficient=steering_coefficient,
-        device=device,
-        dtype=dtype,
-        detach_write=True,
+    dest_layers = list(hook_onto_layers) if hook_onto_layers is not None else [hook_onto_layer]
+    if not dest_layers:
+        raise ValueError("hook_onto_layers must be non-empty")
+    per_dest_vectors = _per_dest_decoder_vectors(
+        dest_layers, batch_steering_vectors, dest_steering_vectors
     )
+
+    def _decoder_hook(vectors: list[torch.Tensor]):
+        return get_hf_activation_steering_hook(
+            vectors=vectors,
+            positions=batch_positions,
+            steering_coefficient=steering_coefficient,
+            device=device,
+            dtype=dtype,
+            detach_write=True,
+        )
+
+    decoder_hook = _decoder_hook(per_dest_vectors[0])
     if not use_deepstack_injection:
-        with add_hook(decoder_submodule, decoder_hook):
+        if len(dest_layers) == 1:
+            with add_hook(decoder_submodule, decoder_hook):
+                yield
+            return
+        with contextlib.ExitStack() as stack:
+            for dest_idx, dest_layer in enumerate(dest_layers):
+                stack.enter_context(
+                    add_hook(
+                        _dest_module(model, decoder_submodule, dest_idx, dest_layer),
+                        _decoder_hook(per_dest_vectors[dest_idx]),
+                    )
+                )
             yield
         return
 
@@ -416,7 +481,18 @@ def oracle_steering_hooks(
             break
 
     if n_layers == 0:
-        with add_hook(decoder_submodule, decoder_hook):
+        if len(dest_layers) == 1:
+            with add_hook(decoder_submodule, decoder_hook):
+                yield
+            return
+        with contextlib.ExitStack() as stack:
+            for dest_idx, dest_layer in enumerate(dest_layers):
+                stack.enter_context(
+                    add_hook(
+                        _dest_module(model, decoder_submodule, dest_idx, dest_layer),
+                        _decoder_hook(per_dest_vectors[dest_idx]),
+                    )
+                )
             yield
         return
 
@@ -452,9 +528,10 @@ def oracle_steering_hooks(
             return steering_coefficient
         return deepstack_coefficients[layer_idx]
 
+    dest_index = {layer: idx for idx, layer in enumerate(dest_layers)}
     with contextlib.ExitStack() as stack:
         for layer_idx in range(n_layers):
-            if layer_idx == hook_onto_layer:
+            if layer_idx in dest_index:
                 continue
             hook = get_hf_activation_steering_hook(
                 vectors=per_layer_vectors[layer_idx],
@@ -466,18 +543,21 @@ def oracle_steering_hooks(
             )
             stack.enter_context(add_hook(get_hf_submodule(inner, layer_idx), hook))
 
-        if 0 <= hook_onto_layer < n_layers:
-            combined = get_hf_multi_source_steering_hook(
-                write_groups=[
-                    (batch_steering_vectors, batch_positions),
-                    (per_layer_vectors[hook_onto_layer], deepstack_positions),
-                ],
-                steering_coefficients=[steering_coefficient, _layer_coeff(hook_onto_layer)],
-                device=device,
-                dtype=dtype,
-                detach_writes=[True, detach_deepstack],
-            )
-            stack.enter_context(add_hook(decoder_submodule, combined))
-        else:
-            stack.enter_context(add_hook(decoder_submodule, decoder_hook))
+        for dest_idx, dest_layer in enumerate(dest_layers):
+            dest_module = _dest_module(model, decoder_submodule, dest_idx, dest_layer)
+            dest_vecs = per_dest_vectors[dest_idx]
+            if 0 <= dest_layer < n_layers:
+                combined = get_hf_multi_source_steering_hook(
+                    write_groups=[
+                        (dest_vecs, batch_positions),
+                        (per_layer_vectors[dest_layer], deepstack_positions),
+                    ],
+                    steering_coefficients=[steering_coefficient, _layer_coeff(dest_layer)],
+                    device=device,
+                    dtype=dtype,
+                    detach_writes=[True, detach_deepstack],
+                )
+                stack.enter_context(add_hook(dest_module, combined))
+            else:
+                stack.enter_context(add_hook(dest_module, _decoder_hook(dest_vecs)))
         yield

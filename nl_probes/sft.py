@@ -280,6 +280,8 @@ def train_features_batch(
         dtype=dtype,
         use_deepstack_injection=cfg.use_deepstack_injection,
         hook_onto_layer=cfg.hook_onto_layer,
+        hook_onto_layers=cfg.hook_onto_layers,
+        dest_steering_vectors=training_batch.dest_steering_vectors,
         deepstack_steering_vectors=training_batch.deepstack_steering_vectors,
         deepstack_positions=training_batch.deepstack_positions,
         deepstack_coefficients=attached_deepstack_coefficients(model),
@@ -325,6 +327,7 @@ def eval_all_datasets(
             processor=processor,
             use_deepstack_injection=cfg.use_deepstack_injection,
             hook_onto_layer=cfg.hook_onto_layer,
+            hook_onto_layers=cfg.hook_onto_layers,
             deepstack_coefficients=attached_deepstack_coefficients(model),
             token_choice_mode=cfg.token_choice_mode,
             token_choice_percent=cfg.token_choice_percent,
@@ -816,6 +819,7 @@ def build_target_validation_datasets(
         token_choice_mode=dataset_flags.token_choice_mode,
         token_choice_percent=dataset_flags.token_choice_percent,
         use_deepstack_injection=(dataset_flags.deepstack_injection and dataset_flags.token_choice_mode == "attn_choice"),
+        num_injection_layers=dataset_flags.num_injection_layers,
     )
     cache_dir = Path(dataset_flags.target_cache_dir)
     ready_path = cache_dir / (
@@ -870,6 +874,7 @@ def mk_cfg(
     save_acts: bool,
     batch_size: int,
     dataset_folder: str = "data/cache",
+    num_injection_layers: int = 1,
 ) -> DatasetLoaderConfig:
     return DatasetLoaderConfig(
         custom_dataset_params=custom_params,
@@ -881,6 +886,7 @@ def mk_cfg(
         save_acts=save_acts,
         batch_size=batch_size,
         dataset_folder=dataset_folder,
+        num_injection_layers=num_injection_layers,
     )
 
 
@@ -891,6 +897,7 @@ def build_vlm_eval_loaders(
     layer_percents: list[int],
     eval_batch_size: int,
     model_kwargs: dict[str, Any],
+    num_injection_layers: int = 1,
 ) -> list[ActDatasetLoader]:
     loaders: list[ActDatasetLoader] = []
     if dataset_flags.classification:
@@ -912,6 +919,7 @@ def build_vlm_eval_loaders(
                         save_acts=True,
                         batch_size=eval_batch_size,
                         dataset_folder="data/val/cache",
+                        num_injection_layers=num_injection_layers,
                     ),
                     model_kwargs=model_kwargs,
                 )
@@ -929,6 +937,7 @@ def build_vlm_eval_loaders(
                     save_acts=True,
                     batch_size=eval_batch_size,
                     dataset_folder="data/val/cache",
+                    num_injection_layers=num_injection_layers,
                 ),
                 model_kwargs=model_kwargs,
             )
@@ -946,6 +955,7 @@ def build_vlm_eval_loaders(
                     save_acts=True,
                     batch_size=eval_batch_size,
                     dataset_folder="data/val/cache",
+                    num_injection_layers=num_injection_layers,
                 ),
                 model_kwargs=model_kwargs,
             )
@@ -1254,6 +1264,7 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
     device = torch.device(f"cuda:{local_rank}")
 
+    num_injection_layers = dataset_flags.num_injection_layers
     hook_layer = 1
     # Text-only AO (original paper mixture). Kept for reference.
     # models = ["Qwen/Qwen3-4B"]
@@ -1293,10 +1304,14 @@ if __name__ == "__main__":
             vlm_loaders: list[ActDatasetLoader] = []
             eval_batch_size = max(1, min(4, train_batch_size))
 
+            def vlm_mk_cfg(*args, **kwargs):
+                kwargs.setdefault("num_injection_layers", num_injection_layers)
+                return mk_cfg(*args, **kwargs)
+
             if dataset_flags.visual_spqa:
                 vlm_loaders.append(
                     VisualSPQADatasetLoader(
-                        dataset_config=mk_cfg(
+                        dataset_config=vlm_mk_cfg(
                             VisualSPQADatasetConfig(),
                             num_train=150_000,
                             num_test=0,
@@ -1319,7 +1334,7 @@ if __name__ == "__main__":
                 for loader_type, config_type in binary_specs:
                     vlm_loaders.append(
                         loader_type(
-                            dataset_config=mk_cfg(
+                            dataset_config=vlm_mk_cfg(
                                 config_type(),
                                 num_train=6_000,
                                 num_test=0,
@@ -1335,7 +1350,7 @@ if __name__ == "__main__":
                     )
                     vlm_loaders.append(
                         loader_type(
-                            dataset_config=mk_cfg(
+                            dataset_config=vlm_mk_cfg(
                                 config_type(),
                                 num_train=0,
                                 num_test=250,
@@ -1354,7 +1369,7 @@ if __name__ == "__main__":
                 for max_k_activations in (1, 50):
                     vlm_loaders.append(
                         CocoCaptionsPastLensDatasetLoader(
-                            dataset_config=mk_cfg(
+                            dataset_config=vlm_mk_cfg(
                                 CocoCaptionsPastLensDatasetConfig(
                                     max_k_tokens=50,
                                     max_k_activations=max_k_activations,
@@ -1373,7 +1388,7 @@ if __name__ == "__main__":
                     )
                 vlm_loaders.append(
                     CocoCaptionsPastLensDatasetLoader(
-                        dataset_config=mk_cfg(
+                        dataset_config=vlm_mk_cfg(
                             CocoCaptionsPastLensDatasetConfig(),
                             num_train=0,
                             num_test=250,
@@ -1391,7 +1406,7 @@ if __name__ == "__main__":
             if dataset_flags.snli_ve:
                 vlm_loaders.append(
                     SNLIVEDatasetLoader(
-                        dataset_config=mk_cfg(
+                        dataset_config=vlm_mk_cfg(
                             SNLIVEDatasetConfig(),
                             num_train=0,
                             num_test=250,
@@ -1444,6 +1459,8 @@ if __name__ == "__main__":
             cfg_kwargs = dict(
                 model_name=model_name,
                 hook_onto_layer=hook_layer,
+                num_injection_layers=num_injection_layers,
+                num_epochs=dataset_flags.num_epochs,
                 hf_repo_name=hf_repo_name,
                 layer_percents=layer_percents,
                 train_batch_size=train_batch_size,

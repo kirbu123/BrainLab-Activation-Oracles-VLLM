@@ -15,6 +15,8 @@ class SelfInterpTrainingConfig:
     # --- Model ---
     model_name: str = "Qwen/Qwen3-8B"
     hook_onto_layer: int = 1
+    hook_onto_layers: list[int] = field(default_factory=lambda: [1])
+    num_injection_layers: int = 1
     layer_percents: list[int] = field(default_factory=lambda: [25, 50, 75])
     act_layers: list[int] = field(default_factory=list)  # derived if empty
 
@@ -84,6 +86,12 @@ class SelfInterpTrainingConfig:
         validate_token_choice(self.token_choice_mode, self.token_choice_percent)
         self.dataset_configs = [asdict(dataset_loader.dataset_config) for dataset_loader in dataset_loaders]
         # act_layers from percents if caller did not set them directly
+        if self.num_injection_layers < 1:
+            raise ValueError(f"num_injection_layers must be >= 1, got {self.num_injection_layers}")
+        if self.num_epochs < 1:
+            raise ValueError(f"num_epochs must be >= 1, got {self.num_epochs}")
+        self.hook_onto_layers = list(range(1, self.num_injection_layers + 1))
+        self.hook_onto_layer = self.hook_onto_layers[0]
         if not self.act_layers:
             self.act_layers = [layer_percent_to_layer(self.model_name, p) for p in self.layer_percents]
 

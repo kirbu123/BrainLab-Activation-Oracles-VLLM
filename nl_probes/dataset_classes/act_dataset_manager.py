@@ -27,6 +27,7 @@ class DatasetLoaderConfig:
     dataset_name: str = ""
     dataset_folder: str = "data/cache"
     seed: int = 42
+    num_injection_layers: int = 1
 
 
 def _config_hash(cfg: DatasetLoaderConfig, split: str, exclude: tuple[str, ...] = ("batch_size",)) -> str:

@@ -113,7 +113,8 @@ def token_count_record(point, visual_ids, deepstack_layers=0):
     ds_counts = [0] * deepstack_layers
     if point.deepstack_steering_vectors is not None:
         ds_counts = [len(vectors) for vectors in point.deepstack_steering_vectors]
-    return {"layer": point.layer, "text": len(positions) - visual, "visual": visual,
+    from nl_probes.utils.dataset_utils import resolved_source_layers
+    return {"layer": resolved_source_layers(point)[0], "text": len(positions) - visual, "visual": visual,
             "deepstack": ds_counts}
 
 
@@ -123,7 +124,7 @@ def materialize_attention_choices(points, tokenizer, model, processor, percent, 
         align_deepstack_to_oracle_slots, collect_activations_multiple_layers, get_hf_submodule,
     )
     from nl_probes.utils.dataset_utils import (
-        create_training_datapoint, recover_oracle_question, source_token_ids,
+        create_training_datapoint, recover_oracle_question, resolved_source_layers, source_token_ids,
     )
     from nl_probes.utils.vlm_utils import vlm_tokenize_target, vision_inputs_to_device, visual_token_ids_from_tokenizer
 
@@ -157,26 +158,35 @@ def materialize_attention_choices(points, tokenizer, model, processor, percent, 
             from nl_probes.dataset_classes.visual_spqa_dataset import _system_prefix_len
             instruction = meta["target_messages"][0]["content"][0]["text"]
             excluded.extend(range(min(_system_prefix_len(processor, instruction), len(ids) - 1)))
+        source_layers = resolved_source_layers(point)
+        attn_layer = source_layers[0]
         ds_features = []
         with contextlib.ExitStack() as stack:
             stack.enter_context(model.disable_adapter())
-            scores = stack.enter_context(capture_attention_scores(model, [point.layer], inputs["attention_mask"]))
+            scores = stack.enter_context(capture_attention_scores(model, [attn_layer], inputs["attention_mask"]))
             acts = collect_activations_multiple_layers(
-                model, {point.layer: get_hf_submodule(model, point.layer, use_lora=True)}, inputs, None, None,
+                model,
+                {layer: get_hf_submodule(model, layer, use_lora=True) for layer in source_layers},
+                inputs,
+                None,
+                None,
             )
             if use_deepstack and point.context_image_paths:
                 ds_features = collect_deepstack_features(model, inputs)
         positions = select_attention_positions(
-            scores[point.layer][0], ids, visual_ids, percent, excluded=excluded,
+            scores[attn_layer][0], ids, visual_ids, percent, excluded=excluded,
             mode=source_mode, example=point.datapoint_type,
         )
         meta.update(token_choice=identity, source_positions=positions, source_token_mode=source_mode)
+        dest_acts = [acts[layer][0, positions].detach() for layer in source_layers]
         new = create_training_datapoint(
             datapoint_type=point.datapoint_type, prompt=recover_oracle_question(point, tokenizer),
-            target_response=point.target_output, layer=point.layer, num_positions=len(positions),
-            tokenizer=tokenizer, acts_BD=acts[point.layer][0, positions].detach(), feature_idx=point.feature_idx,
+            target_response=point.target_output, layer=source_layers[0], num_positions=len(positions),
+            tokenizer=tokenizer, acts_BD=dest_acts[0], feature_idx=point.feature_idx,
             context_input_ids=list(ids), context_positions=positions, context_image_paths=point.context_image_paths,
             ds_label=point.ds_label, meta_info=meta,
+            source_layers=source_layers,
+            dest_acts=dest_acts if len(source_layers) > 1 else None,
         )
         if use_deepstack and point.context_image_paths:
             if not ds_features:

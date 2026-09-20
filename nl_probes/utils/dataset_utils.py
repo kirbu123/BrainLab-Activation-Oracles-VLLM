@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import Any, Mapping
 
 import torch
@@ -17,11 +18,49 @@ from nl_probes.utils.activation_utils import (
 SPECIAL_TOKEN = " ?"
 
 
-def get_introspection_prefix(sae_layer: int, num_positions: int) -> str:
-    prefix = f"Layer: {sae_layer}\n"
+def get_introspection_prefix(sae_layer: int | Sequence[int], num_positions: int) -> str:
+    layers = [sae_layer] if isinstance(sae_layer, int) else list(sae_layer)
+    if not layers:
+        raise ValueError("source_layers must be non-empty")
+    prefix = "".join(f"Layer: {layer}\n" for layer in layers)
     prefix += SPECIAL_TOKEN * num_positions
     prefix += " \n"
     return prefix
+
+
+def injection_dest_layers(num_injection_layers: int) -> list[int]:
+    if num_injection_layers < 1:
+        raise ValueError(f"num_injection_layers must be >= 1, got {num_injection_layers}")
+    return list(range(1, num_injection_layers + 1))
+
+
+def sample_source_layer_assignments(
+    act_layers: Sequence[int],
+    n: int,
+    rng,
+    exhaust_single: bool,
+) -> list[list[int]]:
+    if n < 1:
+        raise ValueError(f"num_injection_layers must be >= 1, got {n}")
+    if not act_layers:
+        raise ValueError("act_layers must contain at least one layer")
+    if n == 1 and exhaust_single:
+        return [[int(layer)] for layer in act_layers]
+    return [[int(rng.choice(list(act_layers))) for _ in range(n)]]
+
+
+def resolved_source_layers(datapoint: "TrainingDataPoint") -> list[int]:
+    if datapoint.source_layers:
+        return list(datapoint.source_layers)
+    return [datapoint.layer]
+
+
+def resolved_dest_steering_vectors(datapoint: "TrainingDataPoint") -> list[torch.Tensor] | None:
+    if datapoint.dest_steering_vectors is not None:
+        return list(datapoint.dest_steering_vectors)
+    if datapoint.steering_vectors is not None:
+        return [datapoint.steering_vectors]
+    return None
 
 
 class FeatureResult(BaseModel):
@@ -52,7 +91,9 @@ class TrainingDataPoint(BaseModel):
     input_ids: list[int]
     labels: list[int]  # Can contain -100 for ignored tokens
     layer: int
+    source_layers: list[int] = Field(default_factory=list)
     steering_vectors: torch.Tensor | None
+    dest_steering_vectors: list[torch.Tensor] | None = None
     positions: list[int]
     feature_idx: int
     target_output: str
@@ -76,6 +117,27 @@ class TrainingDataPoint(BaseModel):
                 raise ValueError("context_* must be provided when steering_vectors is None")
             if len(values.positions) != len(values.context_positions):
                 raise ValueError("positions and context_positions must have the same length")
+        sources = values.source_layers if values.source_layers else [values.layer]
+        if values.source_layers and values.layer != values.source_layers[0]:
+            raise ValueError(
+                f"layer {values.layer} must equal source_layers[0] {values.source_layers[0]}"
+            )
+        dest_vecs = values.dest_steering_vectors
+        if dest_vecs is not None:
+            if len(dest_vecs) != len(sources):
+                raise ValueError(
+                    f"dest_steering_vectors length {len(dest_vecs)} != source_layers {len(sources)}"
+                )
+            for dest_idx, tensor in enumerate(dest_vecs):
+                if tensor.ndim != 2:
+                    raise ValueError(
+                        f"dest_steering_vectors[{dest_idx}] must be [K, D], got {tuple(tensor.shape)}"
+                    )
+                if tensor.shape[0] != len(values.positions):
+                    raise ValueError(
+                        f"dest_steering_vectors[{dest_idx}] has {tensor.shape[0]} rows, "
+                        f"expected {len(values.positions)}"
+                    )
         ds_vecs = values.deepstack_steering_vectors
         if ds_vecs is not None:
             if values.deepstack_positions is None:
@@ -104,6 +166,7 @@ class BatchData(BaseModel):
     steering_vectors: list[torch.Tensor]
     positions: list[list[int]]
     feature_indices: list[int]
+    dest_steering_vectors: list[list[torch.Tensor]] = Field(default_factory=list)
     deepstack_steering_vectors: list[list[torch.Tensor]] = Field(default_factory=list)
     deepstack_positions: list[list[int]] = Field(default_factory=list)
 
@@ -122,6 +185,7 @@ def construct_batch(
     batch_attn_masks = []
     batch_positions = []
     batch_steering_vectors = []
+    batch_dest_steering_vectors: list[list[torch.Tensor]] = []
     batch_feature_indices = []
     batch_deepstack_vectors: list[list[torch.Tensor]] = []
     batch_deepstack_positions: list[list[int]] = []
@@ -155,8 +219,12 @@ def construct_batch(
         else:
             steering_vectors = None
 
+        dest_vecs = data_point.dest_steering_vectors
+        if dest_vecs is None:
+            dest_vecs = [steering_vectors] if steering_vectors is not None else []
         batch_positions.append(padded_positions)
         batch_steering_vectors.append(steering_vectors)
+        batch_dest_steering_vectors.append([tensor.to(device) for tensor in dest_vecs])
         batch_feature_indices.append(data_point.feature_idx)
 
         if n_deepstack_layers == 0 or data_point.deepstack_steering_vectors is None:
@@ -174,6 +242,7 @@ def construct_batch(
         labels=torch.stack(batch_labels),
         attention_mask=torch.stack(batch_attn_masks),
         steering_vectors=batch_steering_vectors,
+        dest_steering_vectors=batch_dest_steering_vectors,
         positions=batch_positions,
         feature_indices=batch_feature_indices,
         deepstack_steering_vectors=batch_deepstack_vectors,
@@ -235,15 +304,20 @@ def materialize_missing_steering_vectors(
             use_deepstack_injection, source_token_mode,
         )
 
+    def _needs_decoder_vectors(dp: TrainingDataPoint) -> bool:
+        if len(resolved_source_layers(dp)) > 1:
+            return dp.dest_steering_vectors is None
+        return dp.steering_vectors is None
+
     to_fill_decoder: list[tuple[int, TrainingDataPoint]] = [
-        (i, dp) for i, dp in enumerate(batch_points) if dp.steering_vectors is None
+        (i, dp) for i, dp in enumerate(batch_points) if _needs_decoder_vectors(dp)
     ]
     to_fill_image: list[tuple[int, TrainingDataPoint]] = [
         (i, dp)
         for i, dp in enumerate(batch_points)
         if dp.context_image_paths
         and (
-            dp.steering_vectors is None
+            _needs_decoder_vectors(dp)
             or (use_deepstack_injection and dp.deepstack_steering_vectors is None)
         )
     ]
@@ -311,7 +385,7 @@ def _materialize_text_items(
         "attention_mask": torch.stack(attn_masks_tensors, dim=0),
     }
 
-    layers_needed = sorted({dp.layer for _, dp in to_fill})
+    layers_needed = sorted({layer for _, dp in to_fill for layer in resolved_source_layers(dp)})
     submodules = {layer: get_hf_submodule(model, layer, use_lora=True) for layer in layers_needed}
 
     was_training = model.training
@@ -330,19 +404,21 @@ def _materialize_text_items(
     new_batch: list[TrainingDataPoint] = list(batch_points)
     for b in range(len(to_fill)):
         idx, dp = to_fill[b]
-        layer = dp.layer
-        acts_BLD = acts_by_layer[layer]
-
         idxs = [p + left_offsets[b] for p in positions_per_item[b]]
-        L = acts_BLD.shape[1]
-        if any(i < 0 or i >= L for i in idxs):
-            raise IndexError(f"Activation index out of range for item {b}: {idxs} with L={L}")
-
-        vectors = acts_BLD[b, idxs, :].detach().contiguous()
-        assert len(vectors.shape) == 2, f"Expected 2D tensor, got vectors.shape={vectors.shape}"
+        dest_vecs = []
+        for layer in resolved_source_layers(dp):
+            acts_BLD = acts_by_layer[layer]
+            L = acts_BLD.shape[1]
+            if any(i < 0 or i >= L for i in idxs):
+                raise IndexError(f"Activation index out of range for item {b}: {idxs} with L={L}")
+            vectors = acts_BLD[b, idxs, :].detach().contiguous()
+            assert len(vectors.shape) == 2, f"Expected 2D tensor, got vectors.shape={vectors.shape}"
+            dest_vecs.append(vectors)
 
         dp_new = dp.model_copy(deep=True)
-        dp_new.steering_vectors = vectors
+        dp_new.steering_vectors = dest_vecs[0]
+        if len(dest_vecs) > 1:
+            dp_new.dest_steering_vectors = dest_vecs
         new_batch[idx] = dp_new
 
     return new_batch
@@ -370,7 +446,7 @@ def _materialize_image_items(
     model.eval()
     try:
         for idx, dp in to_fill:
-            need_decoder = dp.steering_vectors is None
+            need_decoder = dp.dest_steering_vectors is None if len(resolved_source_layers(dp)) > 1 else dp.steering_vectors is None
             need_deepstack = use_deepstack_injection and dp.deepstack_steering_vectors is None
             if not need_decoder and not need_deepstack:
                 continue
@@ -420,7 +496,10 @@ def _materialize_image_items(
             try:
                 with model.disable_adapter():
                     if need_decoder:
-                        submodules = {dp.layer: get_hf_submodule(model, dp.layer, use_lora=True)}
+                        source_layers = resolved_source_layers(dp)
+                        submodules = {
+                            layer: get_hf_submodule(model, layer, use_lora=True) for layer in source_layers
+                        }
                         acts_by_layer = collect_activations_multiple_layers(
                             model=model,
                             submodules=submodules,
@@ -436,16 +515,20 @@ def _materialize_image_items(
 
             dp_new = dp.model_copy(deep=True)
             if need_decoder:
-                acts_BLD = acts_by_layer[dp.layer]
-                L = acts_BLD.shape[1]
                 idxs = list(dp.context_positions)
-                if any(i < 0 or i >= L for i in idxs):
-                    raise IndexError(
-                        f"Activation index out of range for image item {idx}: {idxs} with L={L} "
-                        f"(stored context_input_ids len={len(dp.context_input_ids)})"
-                    )
-                vectors = acts_BLD[0, idxs, :].detach().contiguous()
-                dp_new.steering_vectors = vectors
+                dest_vecs = []
+                for layer in resolved_source_layers(dp):
+                    acts_BLD = acts_by_layer[layer]
+                    L = acts_BLD.shape[1]
+                    if any(i < 0 or i >= L for i in idxs):
+                        raise IndexError(
+                            f"Activation index out of range for image item {idx}: {idxs} with L={L} "
+                            f"(stored context_input_ids len={len(dp.context_input_ids)})"
+                        )
+                    dest_vecs.append(acts_BLD[0, idxs, :].detach().contiguous())
+                dp_new.steering_vectors = dest_vecs[0]
+                if len(dest_vecs) > 1:
+                    dp_new.dest_steering_vectors = dest_vecs
 
             if need_deepstack:
                 if not captured_deepstack:
@@ -521,10 +604,26 @@ def create_training_datapoint(
     context_image_paths: list[str] | None = None,
     ds_label: str | None = None,
     meta_info: Mapping[str, Any] | None = None,
+    source_layers: list[int] | None = None,
+    dest_acts: list[torch.Tensor] | None = None,
 ) -> TrainingDataPoint:
     if meta_info is None:
         meta_info = {}
-    prefix = get_introspection_prefix(layer, num_positions)
+    resolved_layers = list(source_layers) if source_layers else [layer]
+    if not resolved_layers:
+        raise ValueError("source_layers must be non-empty")
+    if source_layers is not None and layer != resolved_layers[0]:
+        raise ValueError(f"layer {layer} must equal source_layers[0] {resolved_layers[0]}")
+    layer = resolved_layers[0]
+    dest_steering_vectors = None
+    if dest_acts is not None:
+        if len(dest_acts) != len(resolved_layers):
+            raise ValueError(
+                f"dest_acts length {len(dest_acts)} != source_layers {len(resolved_layers)}"
+            )
+        dest_steering_vectors = [tensor.cpu().clone().detach() for tensor in dest_acts]
+        acts_BD = dest_steering_vectors[0]
+    prefix = get_introspection_prefix(resolved_layers, num_positions)
     assert prefix not in prompt, f"Prefix {prefix} found in prompt {prompt}"
     oracle_question = prompt
     prompt = prefix + prompt
@@ -575,7 +674,9 @@ def create_training_datapoint(
         input_ids=full_prompt_ids,
         labels=labels,
         layer=layer,
+        source_layers=resolved_layers,
         steering_vectors=acts_BD,
+        dest_steering_vectors=dest_steering_vectors if dest_steering_vectors is not None and len(resolved_layers) > 1 else None,
         positions=positions,
         feature_idx=feature_idx,
         target_output=target_response,
@@ -601,7 +702,7 @@ def source_token_ids(datapoint: TrainingDataPoint) -> list[int]:
 def recover_oracle_question(datapoint: TrainingDataPoint, tokenizer: AutoTokenizer) -> str:
     if datapoint.oracle_question:
         return datapoint.oracle_question
-    prefix = get_introspection_prefix(datapoint.layer, len(datapoint.positions))
+    prefix = get_introspection_prefix(resolved_source_layers(datapoint), len(datapoint.positions))
     decoded = tokenizer.decode(datapoint.input_ids, skip_special_tokens=True)
     if prefix not in decoded:
         raise ValueError(
@@ -643,11 +744,12 @@ def rewrite_datapoint_source_tokens(
     meta_info = dict(datapoint.meta_info)
     meta_info["source_token_mode"] = mode
     meta_info["source_positions"] = new_positions
+    source_layers = resolved_source_layers(datapoint)
     return create_training_datapoint(
         datapoint_type=datapoint.datapoint_type,
         prompt=question,
         target_response=datapoint.target_output,
-        layer=datapoint.layer,
+        layer=source_layers[0],
         num_positions=len(new_positions),
         tokenizer=tokenizer,
         acts_BD=None,
@@ -657,4 +759,5 @@ def rewrite_datapoint_source_tokens(
         context_image_paths=datapoint.context_image_paths,
         ds_label=datapoint.ds_label,
         meta_info=meta_info,
+        source_layers=source_layers,
     )

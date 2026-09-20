@@ -26,6 +26,7 @@ from nl_probes.utils.common import (
 from nl_probes.utils.dataset_utils import (
     TrainingDataPoint,
     create_training_datapoint,
+    sample_source_layer_assignments,
 )
 from nl_probes.utils.eval import run_evaluation
 
@@ -98,6 +99,7 @@ class ClassificationDatasetLoader(ActDatasetLoader):
                 debug_print=False,
                 model_kwargs=self.model_kwargs,
                 model=self.model,
+                num_injection_layers=self.dataset_config.num_injection_layers,
             )
 
             self.save_dataset(data, split)
@@ -180,6 +182,7 @@ def create_vector_dataset(
     debug_print: bool = False,
     model_kwargs: dict[str, Any] | None = None,
     model=None,
+    num_injection_layers: int = 1,
 ) -> list[TrainingDataPoint]:
     assert min_end_offset < 0, "Min end offset must be negative"
     assert max_end_offset < 0, "Max end offset must be negative"
@@ -221,11 +224,14 @@ def create_vector_dataset(
         tokenized_prompts["input_ids"] = tokenized_prompts["input_ids"]
         tokenized_prompts["attention_mask"] = tokenized_prompts["attention_mask"]
 
-        for layer in act_layers:
-            for j in range(len(batch_datapoints)):
-                attn_mask_L = tokenized_prompts["attention_mask"][j].bool()
-                input_ids_L = tokenized_prompts["input_ids"][j, attn_mask_L]
-                L = len(input_ids_L)
+        for j in range(len(batch_datapoints)):
+            attn_mask_L = tokenized_prompts["attention_mask"][j].bool()
+            input_ids_L = tokenized_prompts["input_ids"][j, attn_mask_L]
+            L = len(input_ids_L)
+            assignments = sample_source_layer_assignments(
+                act_layers, num_injection_layers, random, exhaust_single=save_acts
+            )
+            for source_layers in assignments:
                 end_offset = random.randint(max_end_offset, min_end_offset)
                 end_pos = L + end_offset
 
@@ -239,23 +245,26 @@ def create_vector_dataset(
                 positions_K = list(range(begin_pos, end_pos + 1))
                 assert len(positions_K) == k
 
-                # assert tokenized_prompts["input_ids"][j][offset + 1] == tokenizer.eos_token_id
                 if debug_print:
                     view_tokens(input_ids_L, tokenizer, positions_K[-1])
                 classification_prompt = f"{batch_datapoints[j].classification_prompt}"
 
-                if save_acts is False:
-                    acts_KD = None
-                else:
-                    acts_LD = acts_BLD_by_layer_dict[layer][j, attn_mask_L]
-                    acts_KD = acts_LD[positions_K]
-                    assert acts_KD.shape[0] == k
+                dest_acts = None
+                acts_KD = None
+                if save_acts:
+                    dest_acts = []
+                    for layer in source_layers:
+                        acts_LD = acts_BLD_by_layer_dict[layer][j, attn_mask_L]
+                        acts_KD = acts_LD[positions_K]
+                        assert acts_KD.shape[0] == k
+                        dest_acts.append(acts_KD)
+                    acts_KD = dest_acts[0]
 
                 training_data_point = create_training_datapoint(
                     datapoint_type=datapoint_type,
                     prompt=classification_prompt,
                     target_response=batch_datapoints[j].target_response,
-                    layer=layer,
+                    layer=source_layers[0],
                     num_positions=k,
                     tokenizer=tokenizer,
                     acts_BD=acts_KD,
@@ -263,6 +272,8 @@ def create_vector_dataset(
                     context_input_ids=input_ids_L,
                     context_positions=positions_K,
                     ds_label=batch_datapoints[j].ds_label,
+                    source_layers=source_layers,
+                    dest_acts=dest_acts if dest_acts is not None and len(source_layers) > 1 else None,
                 )
                 if training_data_point is None:
                     continue

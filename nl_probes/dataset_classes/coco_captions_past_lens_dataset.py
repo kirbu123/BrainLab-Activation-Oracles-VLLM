@@ -18,7 +18,11 @@ from nl_probes.dataset_classes.act_dataset_manager import (
 )
 from nl_probes.utils.activation_utils import collect_activations_multiple_layers, get_hf_submodule
 from nl_probes.utils.common import layer_percent_to_layer, load_model, load_processor, load_tokenizer
-from nl_probes.utils.dataset_utils import TrainingDataPoint, create_training_datapoint
+from nl_probes.utils.dataset_utils import (
+    TrainingDataPoint,
+    create_training_datapoint,
+    sample_source_layer_assignments,
+)
 from nl_probes.utils.vlm_utils import (
     DEFAULT_MAX_PIXELS,
     extract_image_paths,
@@ -91,6 +95,7 @@ class CocoCaptionsPastLensDatasetLoader(ActDatasetLoader):
                 num_examples=num_examples,
                 seed=self.dataset_config.seed + (0 if split == "train" else 1),
                 model_kwargs=self.model_kwargs,
+                num_injection_layers=self.dataset_config.num_injection_layers,
             )
             self.save_dataset(data, split)
 
@@ -341,6 +346,7 @@ def create_coco_captions_past_lens_dataset(
     num_examples: int,
     seed: int,
     model_kwargs: dict[str, Any] | None = None,
+    num_injection_layers: int = 1,
 ) -> list[TrainingDataPoint]:
     """Create one sampled context task per selected caption record."""
 
@@ -391,7 +397,6 @@ def create_coco_captions_past_lens_dataset(
             continue
 
         acts_by_layer = None
-        selected_layers = act_layers
         if save_acts:
             inputs = vision_inputs_to_device(proc_inputs, device)
             with torch.no_grad():
@@ -402,22 +407,30 @@ def create_coco_captions_past_lens_dataset(
                     None,
                     None,
                 )
-        else:
-            selected_layers = [rng.choice(act_layers)]
+        assignments = sample_source_layer_assignments(
+            act_layers, num_injection_layers, rng, exhaust_single=save_acts
+        )
 
-        for layer in selected_layers:
+        for source_layers in assignments:
+            dest_acts = None
             acts = None
             if save_acts:
-                acts = acts_by_layer[layer][0, activation_positions].detach().contiguous()
+                dest_acts = [
+                    acts_by_layer[layer][0, activation_positions].detach().contiguous()
+                    for layer in source_layers
+                ]
+                acts = dest_acts[0]
             data.append(
                 create_training_datapoint(
                     datapoint_type="coco_captions_past_lens",
                     prompt=_prediction_prompt(direction, len(target_positions)),
                     target_response=target_text,
-                    layer=layer,
+                    layer=source_layers[0],
                     num_positions=len(activation_positions),
                     tokenizer=tokenizer,
                     acts_BD=acts,
+                    source_layers=source_layers,
+                    dest_acts=dest_acts if dest_acts is not None and len(source_layers) > 1 else None,
                     feature_idx=-1,
                     context_input_ids=context_ids,
                     context_positions=activation_positions,
