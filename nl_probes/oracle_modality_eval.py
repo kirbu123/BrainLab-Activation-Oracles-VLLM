@@ -21,6 +21,7 @@ from nl_probes.sft import (
     _ensure_datasets_exist,
     build_target_validation_datasets,
     build_vlm_eval_loaders,
+    wait_for_rank0_artifact,
 )
 from nl_probes.utils.activation_utils import freeze_vision_parameters, get_hf_submodule
 from nl_probes.utils.steering_hooks import (
@@ -170,9 +171,11 @@ def main() -> None:
     processor = load_processor(model_name) if is_vlm_model(model_name) else None
     visual_token_ids = visual_token_ids_from_tokenizer(tokenizer)
 
-    if rank == 0:
-        _ensure_datasets_exist(loaders)
-    dist.barrier()
+    wait_for_rank0_artifact(
+        Path(cfg.run_dir) / "datasets_ready.json",
+        rank,
+        lambda: _ensure_datasets_exist(loaders),
+    )
     standard_eval = load_standard_eval_datasets(loaders)
 
     set_seed(cfg.seed)

@@ -51,3 +51,24 @@ def test_target_validation_cache_build_uses_filesystem_ready_file(monkeypatch, t
         "visual_taboo": [f"visual_taboo:{tmp_path / 'taboo.pt'}"],
         "visual_ssc": [f"visual_ssc:{tmp_path / 'ssc.pt'}"],
     }
+
+
+def test_wait_for_rank0_artifact_rank0_rebuilds_stale_ready_file(tmp_path, monkeypatch):
+    barriers = []
+    monkeypatch.setattr(sft.dist, "barrier", lambda: barriers.append(1))
+    ready = tmp_path / "datasets_ready.json"
+    ready.write_text("stale", encoding="utf-8")
+    built = []
+    sft.wait_for_rank0_artifact(ready, rank=0, build_fn=lambda: built.append(True))
+    assert built == [True]
+    assert ready.read_text(encoding="utf-8") == "ok"
+    assert barriers == [1, 1]
+
+
+def test_wait_for_rank0_artifact_other_ranks_poll_existing_file(tmp_path, monkeypatch):
+    barriers = []
+    monkeypatch.setattr(sft.dist, "barrier", lambda: barriers.append(1))
+    ready = tmp_path / "datasets_ready.json"
+    ready.write_text("ok", encoding="utf-8")
+    sft.wait_for_rank0_artifact(ready, rank=1, build_fn=lambda: (_ for _ in ()).throw(AssertionError("rank 1 must not build")))
+    assert barriers == [1, 1]

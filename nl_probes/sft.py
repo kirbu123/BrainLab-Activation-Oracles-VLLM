@@ -1165,6 +1165,25 @@ def build_loader_groups(
     }
 
 
+def wait_for_rank0_artifact(ready_path: Path, rank: int, build_fn) -> None:
+    """Rank 0 runs build_fn, then writes ready_path. Other ranks poll the file.
+
+    Do not wait in dist.barrier() during a long rank-0 build: NCCL watchdogs abort
+    idle ranks (SIGABRT) after the default collective timeout.
+    """
+    if rank == 0:
+        ready_path.unlink(missing_ok=True)
+    dist.barrier()
+    if rank == 0:
+        build_fn()
+        ready_path.parent.mkdir(parents=True, exist_ok=True)
+        ready_path.write_text("ok", encoding="utf-8")
+    else:
+        while not ready_path.is_file():
+            time.sleep(5)
+    dist.barrier()
+
+
 def _ensure_datasets_exist(dataset_loaders: list[ActDatasetLoader]) -> None:
     """Materialize datasets on disk using a single process (rank 0).
 
@@ -1496,10 +1515,11 @@ if __name__ == "__main__":
 
             tokenizer = load_tokenizer(cfg.model_name)
 
-            # Ensure only rank 0 performs any on-disk dataset creation
-            if rank == 0:
-                _ensure_datasets_exist(loop_dataset_loaders)
-            dist.barrier()
+            wait_for_rank0_artifact(
+                Path(cfg.run_dir) / "datasets_ready.json",
+                rank,
+                lambda: _ensure_datasets_exist(loop_dataset_loaders),
+            )
 
             all_training_data, all_eval_data = build_datasets(
                 cfg, dataset_loaders=loop_dataset_loaders, window_mult=cfg.window_mult
