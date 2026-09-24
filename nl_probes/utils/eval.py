@@ -1,5 +1,6 @@
 import json
 import math
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
@@ -27,7 +28,7 @@ def eval_features_batch(
     tokenizer: AutoTokenizer,
     device: torch.device,
     dtype: torch.dtype,
-    steering_coefficient: float,
+    steering_coefficient: float | Sequence[float],
     generation_kwargs: dict,
     use_deepstack_injection: bool = False,
     hook_onto_layer: int = 1,
@@ -118,7 +119,7 @@ def run_evaluation(
     global_step: int,
     lora_path: str | None,
     eval_batch_size: int,
-    steering_coefficient: float,
+    steering_coefficient: float | Sequence[float],
     generation_kwargs: dict,
     verbose: bool = False,
     processor=None,

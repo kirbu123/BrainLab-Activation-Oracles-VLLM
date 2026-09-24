@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 DEEPSTACK_COEFFICIENTS_FILENAME = "deepstack_steering_coefficients.pt"
+DECODER_COEFFICIENTS_FILENAME = "decoder_steering_coefficients.pt"
 
 
 class DeepStackSteeringCoefficients(nn.Module):
@@ -40,6 +41,39 @@ def save_deepstack_steering_coefficients(directory: str | Path, coefficients: to
     path = Path(directory) / DEEPSTACK_COEFFICIENTS_FILENAME
     torch.save(coefficients.detach().float().cpu(), path)
     return path
+
+
+def save_decoder_steering_coefficients(directory: str | Path, coefficients: Sequence[float]) -> Path:
+    path = Path(directory) / DECODER_COEFFICIENTS_FILENAME
+    tensor = torch.tensor([float(value) for value in coefficients], dtype=torch.float32)
+    torch.save(tensor, path)
+    return path
+
+
+def load_decoder_steering_coefficients(directory: str | Path, n_layers: int) -> list[float]:
+    path = Path(directory) / DECODER_COEFFICIENTS_FILENAME
+    if not path.is_file():
+        raise FileNotFoundError(f"Decoder steering coefficients file not found: {path}")
+    tensor = torch.load(path, map_location="cpu", weights_only=True)
+    if tensor.shape != (n_layers,):
+        raise ValueError(
+            f"Decoder steering coefficients shape {tuple(tensor.shape)} != ({n_layers},)"
+        )
+    return [float(value) for value in tensor.tolist()]
+
+
+def decoder_dest_coefficients(
+    steering_coefficient: float | Sequence[float],
+    n_dest: int,
+) -> list[float]:
+    if isinstance(steering_coefficient, (int, float)):
+        return [float(steering_coefficient)] * n_dest
+    coeffs = [float(value) for value in steering_coefficient]
+    if len(coeffs) != n_dest:
+        raise ValueError(
+            f"steering_coefficient length {len(coeffs)} != dest layers {n_dest}"
+        )
+    return coeffs
 
 
 def load_deepstack_steering_coefficients(
@@ -423,7 +457,7 @@ def oracle_steering_hooks(
     decoder_submodule: torch.nn.Module,
     batch_steering_vectors: list[torch.Tensor],
     batch_positions: list[list[int]],
-    steering_coefficient: float,
+    steering_coefficient: float | Sequence[float],
     device: torch.device,
     dtype: torch.dtype,
     use_deepstack_injection: bool = False,
@@ -440,21 +474,22 @@ def oracle_steering_hooks(
     dest_layers = list(hook_onto_layers) if hook_onto_layers is not None else [hook_onto_layer]
     if not dest_layers:
         raise ValueError("hook_onto_layers must be non-empty")
+    dest_coeffs = decoder_dest_coefficients(steering_coefficient, len(dest_layers))
     per_dest_vectors = _per_dest_decoder_vectors(
         dest_layers, batch_steering_vectors, dest_steering_vectors
     )
 
-    def _decoder_hook(vectors: list[torch.Tensor]):
+    def _decoder_hook(vectors: list[torch.Tensor], coefficient: float):
         return get_hf_activation_steering_hook(
             vectors=vectors,
             positions=batch_positions,
-            steering_coefficient=steering_coefficient,
+            steering_coefficient=coefficient,
             device=device,
             dtype=dtype,
             detach_write=True,
         )
 
-    decoder_hook = _decoder_hook(per_dest_vectors[0])
+    decoder_hook = _decoder_hook(per_dest_vectors[0], dest_coeffs[0])
     if not use_deepstack_injection:
         if len(dest_layers) == 1:
             with add_hook(decoder_submodule, decoder_hook):
@@ -465,7 +500,7 @@ def oracle_steering_hooks(
                 stack.enter_context(
                     add_hook(
                         _dest_module(model, decoder_submodule, dest_idx, dest_layer),
-                        _decoder_hook(per_dest_vectors[dest_idx]),
+                        _decoder_hook(per_dest_vectors[dest_idx], dest_coeffs[dest_idx]),
                     )
                 )
             yield
@@ -490,7 +525,7 @@ def oracle_steering_hooks(
                 stack.enter_context(
                     add_hook(
                         _dest_module(model, decoder_submodule, dest_idx, dest_layer),
-                        _decoder_hook(per_dest_vectors[dest_idx]),
+                        _decoder_hook(per_dest_vectors[dest_idx], dest_coeffs[dest_idx]),
                     )
                 )
             yield
@@ -525,7 +560,7 @@ def oracle_steering_hooks(
 
     def _layer_coeff(layer_idx: int) -> float | torch.Tensor:
         if deepstack_coefficients is None:
-            return steering_coefficient
+            return dest_coeffs[0]
         return deepstack_coefficients[layer_idx]
 
     dest_index = {layer: idx for idx, layer in enumerate(dest_layers)}
@@ -552,12 +587,12 @@ def oracle_steering_hooks(
                         (dest_vecs, batch_positions),
                         (per_layer_vectors[dest_layer], deepstack_positions),
                     ],
-                    steering_coefficients=[steering_coefficient, _layer_coeff(dest_layer)],
+                    steering_coefficients=[dest_coeffs[dest_idx], _layer_coeff(dest_layer)],
                     device=device,
                     dtype=dtype,
                     detach_writes=[True, detach_deepstack],
                 )
                 stack.enter_context(add_hook(dest_module, combined))
             else:
-                stack.enter_context(add_hook(dest_module, _decoder_hook(dest_vecs)))
+                stack.enter_context(add_hook(dest_module, _decoder_hook(dest_vecs, dest_coeffs[dest_idx])))
         yield

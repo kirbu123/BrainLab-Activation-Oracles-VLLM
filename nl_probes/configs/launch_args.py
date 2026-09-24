@@ -43,6 +43,15 @@ def _add_injection_layers_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_optimize_steering_coefs_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--optimize-steering-coefs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="At each validation, search per-dest decoder steering coefficients (default: off)",
+    )
+
+
 def _add_num_epochs_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--num-epochs",
@@ -89,6 +98,7 @@ class DatasetFamilyFlags:
     target_activation_diff: bool = False
     deepstack_injection: bool = False
     train_deepstack_coefficients: bool = False
+    optimize_steering_coefs: bool = False
     deepstack_coefficient_init: float = 1.0
     eval_steps: int = 2000
     token_choice_mode: str = "default"
@@ -118,6 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_num_epochs_arg(parser)
     _add_injection_layers_arg(parser)
+    _add_optimize_steering_coefs_arg(parser)
     parser.add_argument(
         "--deepstack-coefficient-init",
         type=float,
@@ -313,6 +324,7 @@ def parse_launch_args(argv: list[str] | None = None) -> DatasetFamilyFlags:
         target_activation_diff=namespace.target_activation_diff,
         deepstack_injection=namespace.deepstack_injection,
         train_deepstack_coefficients=namespace.deepstack_trainable_coefficients,
+        optimize_steering_coefs=namespace.optimize_steering_coefs,
         target_adapter_registry=namespace.target_adapter_registry,
         target_val_root=namespace.target_val_root,
         target_cache_dir=namespace.target_cache_dir,
@@ -336,6 +348,11 @@ def validate_family_flags(flags: DatasetFamilyFlags) -> None:
             "--visual-spqa, --classification, or --context-prediction."
         )
     _validate_deepstack_coefficient_flags(flags)
+    if flags.optimize_steering_coefs and not validation_enabled(flags):
+        raise ValueError(
+            "--optimize-steering-coefs requires at least one validation dataset. "
+            "Enable --classification, --context-prediction, --snli-ve, or a target-organism val flag."
+        )
 
 
 def _validate_injection_layer_flags(flags: DatasetFamilyFlags) -> None:
@@ -376,6 +393,8 @@ def enabled_family_tokens(flags: DatasetFamilyFlags) -> list[str]:
         tokens.append("deepstack")
     if flags.train_deepstack_coefficients:
         tokens.append("dscoef")
+    if flags.optimize_steering_coefs:
+        tokens.append("optsteer")
     if flags.num_injection_layers != 1:
         tokens.append(f"inj{flags.num_injection_layers}")
     if flags.num_epochs != 1:

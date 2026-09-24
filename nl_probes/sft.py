@@ -28,10 +28,16 @@ import wandb
 from nl_probes.utils.steering_hooks import (
     attached_deepstack_coefficients,
     deepstack_layer_count,
+    load_decoder_steering_coefficients,
     load_deepstack_steering_coefficients,
     oracle_steering_hooks,
+    save_decoder_steering_coefficients,
     save_deepstack_steering_coefficients,
     DeepStackSteeringCoefficients,
+)
+from nl_probes.utils.steering_coef_search import (
+    coordinate_descent_steering_coefs,
+    format_coef_trial_id,
 )
 from nl_probes.configs.sft_config import SelfInterpTrainingConfig
 from nl_probes.configs.launch_args import (
@@ -79,7 +85,7 @@ from nl_probes.utils.dataset_utils import (
     materialize_missing_steering_vectors,
 )
 from nl_probes.utils.eval import run_evaluation, score_eval_dataset
-from nl_probes.utils.results_html import ResultsHtmlLogger
+from nl_probes.utils.results_html import ResultsHtmlLogger, TARGET_DATASETS
 
 
 def create_run_logger(log_path: str) -> logging.Logger:
@@ -250,6 +256,31 @@ def _maybe_save_deepstack_coefficients(cfg: SelfInterpTrainingConfig, model, dir
     save_deepstack_steering_coefficients(directory, coeffs)
 
 
+def _decoder_steering_coefficients(cfg: SelfInterpTrainingConfig) -> list[float]:
+    if not cfg.steering_coefficients:
+        raise ValueError("steering_coefficients is empty")
+    return list(cfg.steering_coefficients)
+
+
+def _steering_coefficient_log(cfg: SelfInterpTrainingConfig) -> dict[str, float]:
+    return {
+        f"steering_coefficient/{i}": float(value)
+        for i, value in enumerate(_decoder_steering_coefficients(cfg))
+    }
+
+
+def _maybe_save_decoder_coefficients(cfg: SelfInterpTrainingConfig, directory: str) -> None:
+    if not cfg.optimize_steering_coefs:
+        return
+    save_decoder_steering_coefficients(directory, _decoder_steering_coefficients(cfg))
+
+
+def _broadcast_steering_coefficients(cfg: SelfInterpTrainingConfig) -> None:
+    holder = [_decoder_steering_coefficients(cfg)]
+    dist.broadcast_object_list(holder, src=0)
+    cfg.steering_coefficients = holder[0]
+
+
 def train_features_batch(
     cfg: SelfInterpTrainingConfig,
     training_batch: BatchData,
@@ -275,7 +306,7 @@ def train_features_batch(
         decoder_submodule=submodule,
         batch_steering_vectors=batch_steering_vectors,
         batch_positions=batch_positions,
-        steering_coefficient=cfg.steering_coefficient,
+        steering_coefficient=_decoder_steering_coefficients(cfg),
         device=device,
         dtype=dtype,
         use_deepstack_injection=cfg.use_deepstack_injection,
@@ -306,11 +337,17 @@ def eval_all_datasets(
     dtype: torch.dtype,
     global_step: int,
     processor=None,
+    steering_coefficients: list[float] | None = None,
+    write_details: bool = True,
 ) -> dict[str, float]:
+    if not eval_datasets:
+        raise ValueError("eval_datasets is empty")
+    coeffs = list(steering_coefficients) if steering_coefficients is not None else _decoder_steering_coefficients(cfg)
     model.eval()
     eval_results = {}
     from nl_probes.utils.token_choice import token_count_metrics
     all_token_counts = []
+    details_path = str(Path(cfg.run_dir) / "target_validation_predictions.jsonl") if write_details else None
     for ds in eval_datasets:
         eval_responses = run_evaluation(
             eval_data=eval_datasets[ds],
@@ -322,7 +359,7 @@ def eval_all_datasets(
             global_step=global_step,
             lora_path=None,
             eval_batch_size=cfg.eval_batch_size,
-            steering_coefficient=cfg.steering_coefficient,
+            steering_coefficient=coeffs,
             generation_kwargs=cfg.generation_kwargs,
             processor=processor,
             use_deepstack_injection=cfg.use_deepstack_injection,
@@ -341,7 +378,7 @@ def eval_all_datasets(
                 eval_responses,
                 eval_datasets[ds],
                 global_step=global_step,
-                details_path=str(Path(cfg.run_dir) / "target_validation_predictions.jsonl"),
+                details_path=details_path,
             )
         )
         percent_format_correct = eval_results[f"eval_format_correct/{ds}"]
@@ -349,11 +386,6 @@ def eval_all_datasets(
         print(f"Step {global_step} {ds} format correct: {percent_format_correct}, ans correct: {percent_ans_correct}")
 
     eval_results.update(token_count_metrics(all_token_counts, "all"))
-    wandb.log(
-        eval_results,
-        step=global_step,
-    )
-    wandb.summary.update(eval_results)
     model.train()
 
     # Have occasionally seen OOMs on first training step after eval, so clear cache here
@@ -471,6 +503,11 @@ def train_model(
             coeff_module = DeepStackSteeringCoefficients(n_layers, cfg.deepstack_coefficient_init).to(device)
         model.add_module("deepstack_steering_coefficients", coeff_module)
 
+    if cfg.optimize_steering_coefs and cfg.load_lora_path is not None:
+        cfg.steering_coefficients = load_decoder_steering_coefficients(
+            cfg.load_lora_path, n_layers=cfg.num_injection_layers
+        )
+
     model.print_trainable_parameters()
 
     # Wrap with DDP for training, but keep the PEFT model reference for hooks/eval
@@ -538,17 +575,53 @@ def train_model(
     def _record_eval_and_write_html(step: int) -> None:
         if results_log is None:
             return
-        metrics = eval_all_datasets(
-            cfg,
-            eval_datasets,
-            model,
-            tokenizer,
-            submodule,
-            device,
-            dtype,
-            step,
-            processor=processor,
-        )
+        if not eval_datasets:
+            raise ValueError("validation requested but eval_datasets is empty")
+
+        def _evaluate_coefficients(coefficients: list[float], write_details: bool) -> dict[str, float]:
+            return eval_all_datasets(
+                cfg,
+                eval_datasets,
+                model,
+                tokenizer,
+                submodule,
+                device,
+                dtype,
+                step,
+                processor=processor,
+                steering_coefficients=coefficients,
+                write_details=write_details,
+            )
+
+        search_logs: dict[str, float] = {}
+        if cfg.optimize_steering_coefs:
+            center = _decoder_steering_coefficients(cfg)
+            search = coordinate_descent_steering_coefs(
+                center,
+                lambda coefs: _evaluate_coefficients(list(coefs), write_details=False),
+            )
+            assert run_logger is not None
+            for trial in search.trials:
+                is_winner = trial.coefficients == search.winner.coefficients
+                run_logger.info(
+                    "steer_search trial coefs=%s score=%.6g winner=%s metrics=%s",
+                    json.dumps(list(trial.coefficients)),
+                    trial.score,
+                    is_winner,
+                    json.dumps(trial.metrics, sort_keys=True),
+                )
+                search_logs[f"steer_search/score/{format_coef_trial_id(trial.coefficients)}"] = trial.score
+            cfg.steering_coefficients = list(search.winner.coefficients)
+            needs_details = any(name in TARGET_DATASETS for name in eval_datasets)
+            if needs_details:
+                metrics = _evaluate_coefficients(cfg.steering_coefficients, write_details=True)
+            else:
+                metrics = search.winner.metrics
+            metrics = {**metrics, **_steering_coefficient_log(cfg), **search_logs}
+        else:
+            metrics = _evaluate_coefficients(_decoder_steering_coefficients(cfg), write_details=True)
+        wandb.log(metrics, step=step)
+        wandb.summary.update(metrics)
         results_log.append_eval(
             step,
             metrics,
@@ -641,6 +714,8 @@ def train_model(
                 if eval_datasets and global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
                     if rank == 0:
                         _record_eval_and_write_html(global_step)
+                    if cfg.optimize_steering_coefs:
+                        _broadcast_steering_coefficients(cfg)
                     dist.barrier()
 
                 if global_step % cfg.save_steps == 0 and global_step > 0:
@@ -648,6 +723,7 @@ def train_model(
                         checkpoint_dir = f"{cfg.save_dir}/step_{global_step}"
                         model.save_pretrained(checkpoint_dir)
                         _maybe_save_deepstack_coefficients(cfg, model, checkpoint_dir)
+                        _maybe_save_decoder_coefficients(cfg, checkpoint_dir)
                         assert run_logger is not None
                         run_logger.info("Saved checkpoint: %s", checkpoint_dir)
                         if cfg.hf_push_to_hub and cfg.hf_repo_id:
@@ -673,6 +749,7 @@ def train_model(
         final_checkpoint_dir = f"{cfg.save_dir}/final"
         model.save_pretrained(final_checkpoint_dir)
         _maybe_save_deepstack_coefficients(cfg, model, final_checkpoint_dir)
+        _maybe_save_decoder_coefficients(cfg, final_checkpoint_dir)
         assert run_logger is not None
         run_logger.info("Saved final checkpoint: %s", final_checkpoint_dir)
 
@@ -680,6 +757,8 @@ def train_model(
         if eval_datasets:
             print("Running final evaluation...")
             _record_eval_and_write_html(global_step)
+            if cfg.optimize_steering_coefs:
+                _maybe_save_decoder_coefficients(cfg, final_checkpoint_dir)
         else:
             assert results_log is not None
             results_log.write(cfg)
@@ -1494,6 +1573,7 @@ if __name__ == "__main__":
                 target_activation_source=target_activation_source(dataset_flags),
                 use_deepstack_injection=dataset_flags.deepstack_injection,
                 train_deepstack_coefficients=dataset_flags.train_deepstack_coefficients,
+                optimize_steering_coefs=dataset_flags.optimize_steering_coefs,
                 deepstack_coefficient_init=dataset_flags.deepstack_coefficient_init,
                 token_choice_mode=dataset_flags.token_choice_mode,
                 token_choice_percent=dataset_flags.token_choice_percent,

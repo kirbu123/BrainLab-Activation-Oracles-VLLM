@@ -109,4 +109,31 @@ RUNS: tuple[CatalogRun, ...] = (
             "vpqa_Qwen3-VL-4B-Instruct"
         ),
     ),
+    CatalogRun(
+        name="Inj 3 / 3 epochs",
+        color="#86efac",
+        description=(
+            "Decoder activation injection into layers 1..3 for three epochs. "
+            "Steering coefficients stay fixed at 1.0; DeepStack is disabled. "
+            "Target validation reads target-adapter activations."
+        ),
+        directory=(
+            "20260923_104405_visual_spqa_cls_cococtx_snlive_vtaboo_vuser_vssc_vpqa_"
+            "inj3_ep3_Qwen3-VL-4B-Instruct"
+        ),
+    ),
+    CatalogRun(
+        name="Inj 3 / 3 epochs + optsteer",
+        color="#fb7185",
+        description=(
+            "Decoder activation injection into layers 1..3 for three epochs. "
+            "Per-dest steering coefficients are coordinate-descent searched at "
+            "each validation and then kept for later training. DeepStack is "
+            "disabled. Target validation reads target-adapter activations."
+        ),
+        directory=(
+            "20260924_190146_visual_spqa_cls_cococtx_snlive_vtaboo_vuser_vssc_vpqa_"
+            "optsteer_inj3_ep3_Qwen3-VL-4B-Instruct"
+        ),
+    ),
 )

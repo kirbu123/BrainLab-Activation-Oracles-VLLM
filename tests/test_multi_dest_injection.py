@@ -88,6 +88,48 @@ def test_oracle_steering_hooks_n3_writes_each_dest_layer():
     assert torch.allclose(out3, expected3)
 
 
+def test_oracle_steering_hooks_n3_uses_per_dest_coefficients():
+    class DummyVLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = torch.nn.Module()
+            self.language_model.layers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(4)])
+            self.config = type("Cfg", (), {"_name_or_path": "Qwen/Qwen3-VL-4B-Instruct"})()
+
+    dummy = DummyVLM()
+    resid = torch.ones(1, 3, 2)
+    dest_vecs = [
+        torch.tensor([[2.0, 0.0]]),
+        torch.tensor([[0.0, 4.0]]),
+        torch.tensor([[3.0, 3.0]]),
+    ]
+    coeffs = [1.0, 0.5, 2.0]
+    with oracle_steering_hooks(
+        model=dummy,
+        decoder_submodule=dummy.language_model.layers[1],
+        batch_steering_vectors=[dest_vecs[0]],
+        batch_positions=[[1]],
+        steering_coefficient=coeffs,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        hook_onto_layers=[1, 2, 3],
+        dest_steering_vectors=[dest_vecs],
+    ):
+        out1 = dummy.language_model.layers[1](resid.clone())
+        out2 = dummy.language_model.layers[2](resid.clone())
+        out3 = dummy.language_model.layers[3](resid.clone())
+
+    expected1 = resid.clone()
+    expected1[0, 1] = _expected_steered(resid[0, 1], dest_vecs[0][0], coeffs[0])
+    expected2 = resid.clone()
+    expected2[0, 1] = _expected_steered(resid[0, 1], dest_vecs[1][0], coeffs[1])
+    expected3 = resid.clone()
+    expected3[0, 1] = _expected_steered(resid[0, 1], dest_vecs[2][0], coeffs[2])
+    assert torch.allclose(out1, expected1)
+    assert torch.allclose(out2, expected2)
+    assert torch.allclose(out3, expected3)
+
+
 def test_materialize_fills_dest_vectors_from_assigned_sources():
     from nl_probes.utils.dataset_utils import TrainingDataPoint, _materialize_text_items
 

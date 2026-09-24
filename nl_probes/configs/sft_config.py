@@ -28,6 +28,8 @@ class SelfInterpTrainingConfig:
     use_decoder_vectors: bool = True
     generation_kwargs: dict[str, Any] = field(default_factory=lambda: {"do_sample": False, "max_new_tokens": 20})
     steering_coefficient: float = 1.0
+    steering_coefficients: list[float] = field(default_factory=list)
+    optimize_steering_coefs: bool = False
     use_deepstack_injection: bool = False
     train_deepstack_coefficients: bool = False
     deepstack_coefficient_init: float = 1.0
@@ -92,6 +94,14 @@ class SelfInterpTrainingConfig:
             raise ValueError(f"num_epochs must be >= 1, got {self.num_epochs}")
         self.hook_onto_layers = list(range(1, self.num_injection_layers + 1))
         self.hook_onto_layer = self.hook_onto_layers[0]
+        if not self.steering_coefficients:
+            self.steering_coefficients = [float(self.steering_coefficient)] * self.num_injection_layers
+        if len(self.steering_coefficients) != self.num_injection_layers:
+            raise ValueError(
+                f"steering_coefficients length {len(self.steering_coefficients)} "
+                f"!= num_injection_layers {self.num_injection_layers}"
+            )
+        self.steering_coefficients = [float(value) for value in self.steering_coefficients]
         if not self.act_layers:
             self.act_layers = [layer_percent_to_layer(self.model_name, p) for p in self.layer_percents]
 

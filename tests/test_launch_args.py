@@ -219,6 +219,34 @@ def test_deepstack_trainable_coefficients_requires_injection():
         )
 
 
+def test_optimize_steering_coefs_is_off_by_default():
+    flags = parse_launch_args([])
+    assert not flags.optimize_steering_coefs
+    assert "optsteer" not in enabled_family_tokens(flags)
+    assert "optimize_steering_coefs" in flags.as_dict()
+
+
+def test_optimize_steering_coefs_flag_and_wandb_token():
+    flags = parse_launch_args(["--optimize-steering-coefs"])
+    assert flags.optimize_steering_coefs
+    assert enabled_family_tokens(flags)[-1] == "optsteer"
+    assert compose_wandb_suffix(flags, "Qwen/Qwen3-VL-4B-Instruct").endswith(
+        "_optsteer_Qwen3-VL-4B-Instruct"
+    )
+
+
+def test_optimize_steering_coefs_requires_validation_family():
+    with pytest.raises(ValueError, match="--optimize-steering-coefs requires at least one validation dataset"):
+        parse_launch_args(
+            [
+                "--optimize-steering-coefs",
+                "--no-classification",
+                "--no-context-prediction",
+                "--no-snli-ve",
+            ]
+        )
+
+
 def test_target_activation_diff_is_parsed_for_train_and_eval():
     train_flags = parse_launch_args(["--target-activation-diff"])
     assert train_flags.target_activation_diff
