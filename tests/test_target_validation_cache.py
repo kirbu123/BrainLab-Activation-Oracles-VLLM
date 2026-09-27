@@ -40,7 +40,7 @@ def test_real_target_collector_explicitly_runs_vision(monkeypatch, use_deepstack
     scores = {1: torch.ones(1, 4)}
 
     @contextmanager
-    def capture(*args):
+    def capture(*args, **kwargs):
         yield scores
 
     monkeypatch.setattr(token_choice, "capture_attention_scores", capture)
@@ -423,13 +423,15 @@ def test_attention_choice_target_cache_and_deepstack(tmp_path):
             return {"<|image_pad|>": 7, "<|video_pad|>": 8}[name]
 
     def tokenize(runtime, messages, add_generation_prompt):
-        return TokenizedTarget((7, 3, 7, 4), {"input_ids": torch.tensor([[7, 3, 7, 4]])})
+        ids = (7, 7, 7, 7, 7, 3, 4)
+        return TokenizedTarget(ids, {"input_ids": torch.tensor([list(ids)])})
 
-    def features(runtime, tokenized, layers, use_ds):
-        acts = {layer: torch.arange(16).reshape(1, 4, 4).float() for layer in layers}
-        scores = {layer: torch.tensor([[4., 1., 3., 2.]]) if layer == 1
-                  else torch.tensor([[1., 4., 2., 3.]]) for layer in layers}
-        return acts, scores, [torch.ones(2, 4)] if use_ds else []
+    def features(runtime, tokenized, layers, use_ds, query_index=None):
+        n = len(tokenized.input_ids)
+        acts = {layer: torch.arange(n * 4).reshape(1, n, 4).float() for layer in layers}
+        scores = {layer: torch.tensor([[4., 1., 3., 2., 5., 9., 8.]]) if layer == 1
+                  else torch.tensor([[1., 4., 2., 3., 0., 1., 7.]]) for layer in layers}
+        return acts, scores, [torch.ones(5, 4)] if use_ds else []
 
     ops = TargetModelOperations(
         load_base=lambda registry: {}, tokenizer=lambda runtime: Tokenizer(),
@@ -439,7 +441,7 @@ def test_attention_choice_target_cache_and_deepstack(tmp_path):
         disable_adapter=lambda *args: None, close=lambda *args: None,
         collect_attention_features=features,
         collect_base_activations=lambda runtime, tokenized, layers: {
-            layer: torch.ones(1, 4, 4) for layer in layers},
+            layer: torch.ones(1, len(tokenized.input_ids), 4) for layer in layers},
     )
     settings = ProbeSettings(layers=(1, 3), variants=("prompt_tail",), token_choice_mode="attn_choice",
                              token_choice_percent=50, use_deepstack_injection=True,
@@ -447,13 +449,13 @@ def test_attention_choice_target_cache_and_deepstack(tmp_path):
     first = precompute_target_validation_cache(registry_path=registry_path, manifest_path=manifest_path,
         settings=settings, cache_dir=tmp_path / "cache", operations=ops)
     rows = load_target_validation_cache(first)
-    assert list(rows[0].meta_info["source_positions"]) == [0, 2]
-    assert list(rows[1].meta_info["source_positions"]) == [1, 3]
-    assert len(rows[0].deepstack_positions) == 2
-    assert len(rows[1].deepstack_positions) == 0
-    assert torch.equal(rows[0].steering_vectors, torch.tensor([[-1., 0., 1., 2.], [7., 8., 9., 10.]]))
+    assert list(rows[0].meta_info["source_positions"]) == [4, 5]
+    assert list(rows[1].meta_info["source_positions"]) == [4, 6]
+    assert len(rows[0].deepstack_positions) == 1
+    assert len(rows[1].deepstack_positions) == 1
+    assert torch.equal(rows[0].steering_vectors, torch.tensor([[15., 16., 17., 18.], [19., 20., 21., 22.]]))
     second = precompute_target_validation_cache(registry_path=registry_path, manifest_path=manifest_path,
-        settings=settings.model_copy(update={"token_choice_percent": 25}),
+        settings=settings.model_copy(update={"token_choice_percent": 25, "source_token_mode": "text"}),
         cache_dir=tmp_path / "cache", operations=ops)
     assert first != second
     assert len(load_target_validation_cache(second)[0].positions) == 1

@@ -298,13 +298,31 @@ def build_record_datapoints(
         TargetMessage(role="assistant", content=response),
     )
     full = operations.tokenize(runtime, full_messages, False)
+    tokenizer = operations.tokenizer(runtime)
     attention_features = {}
     if settings.token_choice_mode == "attn_choice":
+        from nl_probes.utils.token_choice import last_user_text_query_index, special_token_ids
+
         if operations.collect_attention_features is None:
             raise ValueError("attn_choice requires collect_attention_features")
+        if list(full.input_ids[: len(prompt.input_ids)]) != list(prompt.input_ids):
+            raise ValueError(
+                f"Record {record.record_id}: prompt ids are not a prefix of prompt_response"
+            )
+        visual_token_ids = visual_token_ids_from_tokenizer(tokenizer)
+        special_ids = special_token_ids(tokenizer, visual_token_ids)
         for variant, tokenized in (("prompt_tail", prompt), ("prompt_response", full)):
+            assistant_indices = (
+                list(range(len(prompt.input_ids), len(tokenized.input_ids)))
+                if variant == "prompt_response"
+                else []
+            )
+            query_index = last_user_text_query_index(
+                list(tokenized.input_ids), visual_token_ids, special_ids, assistant_indices,
+            )
             acts, scores, deepstack = operations.collect_attention_features(
                 runtime, tokenized, settings.layers, settings.use_deepstack_injection,
+                query_index=query_index,
             )
             if settings.activation_source == "adapter_base_diff":
                 if operations.collect_base_activations is None:
@@ -345,7 +363,6 @@ def build_record_datapoints(
     if not prompt_positions or not full_positions:
         raise ValueError(f"Record {record.record_id} produced empty probe positions")
 
-    tokenizer = operations.tokenizer(runtime)
     visual_token_ids = None
     if settings.source_token_mode != "mixed" or settings.token_choice_mode == "attn_choice":
         visual_token_ids = visual_token_ids_from_tokenizer(tokenizer)
@@ -370,11 +387,40 @@ def build_record_datapoints(
             else:
                 raise ValueError(f"Unsupported probe variant: {variant}")
             if settings.token_choice_mode == "attn_choice":
-                from nl_probes.utils.token_choice import select_attention_positions
-                positions = tuple(select_attention_positions(
-                    attention_features[variant][1][source_layers[0]][0], list(source_ids), visual_token_ids,
-                    settings.token_choice_percent, mode=settings.source_token_mode, example=record.record_id,
-                ))
+                from nl_probes.utils.token_choice import (
+                    attn_selection_exclusions,
+                    select_attention_positions_per_layer,
+                )
+
+                assistant_indices = (
+                    list(range(len(prompt.input_ids), len(source_ids)))
+                    if variant == "prompt_response"
+                    else []
+                )
+                excluded = attn_selection_exclusions(
+                    list(source_ids),
+                    visual_token_ids,
+                    tokenizer,
+                    assistant_indices=assistant_indices,
+                )
+                positions_per_layer = select_attention_positions_per_layer(
+                    attention_features[variant][1],
+                    source_layers,
+                    list(source_ids),
+                    visual_token_ids,
+                    settings.token_choice_percent,
+                    excluded=excluded,
+                    mode=settings.source_token_mode,
+                    example=record.record_id,
+                )
+                positions = tuple(positions_per_layer[source_layers[0]])
+                dest_acts = [
+                    vectors_source[layer][0, list(positions_per_layer[layer]), :]
+                    .detach()
+                    .to(device="cpu")
+                    .contiguous()
+                    for layer in source_layers
+                ]
             else:
                 positions = tuple(sample_modality_positions(
                     list(source_ids),
@@ -383,10 +429,10 @@ def build_record_datapoints(
                     len(default_positions),
                     original_positions=list(default_positions),
                 ))
-            dest_acts = [
-                vectors_source[layer][0, list(positions), :].detach().to(device="cpu").contiguous()
-                for layer in source_layers
-            ]
+                dest_acts = [
+                    vectors_source[layer][0, list(positions), :].detach().to(device="cpu").contiguous()
+                    for layer in source_layers
+                ]
             metadata_dict = _record_metadata(
                     record=record,
                     registry=registry,
@@ -404,6 +450,9 @@ def build_record_datapoints(
                 metadata_dict["token_choice"] = selection_identity(
                     settings.token_choice_mode, settings.token_choice_percent, settings.source_token_mode,
                 )
+                metadata_dict["source_positions_per_layer"] = {
+                    str(layer): pos for layer, pos in positions_per_layer.items()
+                }
             metadata = FrozenMetadata(metadata_dict)
             point = create_training_datapoint(
                     datapoint_type=record.family,
@@ -711,12 +760,13 @@ def default_target_model_operations() -> TargetModelOperations:
     def disable_adapter(runtime, entry: AdapterEntry) -> None:
         runtime["model"].delete_adapter(entry.organism_id)
 
-    def collect_attention_features(runtime, tokenized, layers, use_deepstack):
+    def collect_attention_features(runtime, tokenized, layers, use_deepstack, query_index=None):
         from nl_probes.utils.token_choice import capture_attention_scores
         from nl_probes.utils.activation_utils import collect_deepstack_features
         features = []
         with capture_attention_scores(
                 runtime["model"], layers, tokenized.model_inputs["attention_mask"],
+                query_index=query_index,
         ) as scores:
             acts = collect(runtime, tokenized, layers)
             if use_deepstack:

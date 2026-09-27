@@ -1,12 +1,16 @@
 from types import SimpleNamespace
+import contextlib
 
 import pytest
 import torch
 
 from nl_probes.configs.launch_args import parse_launch_args, parse_eval_launch_args
 from nl_probes.utils.token_choice import (
+    ATTN_SINK_VISUAL_PREFIX,
+    last_user_text_query_index,
     received_attention, select_attention_positions, token_count_metrics,
     capture_attention_scores, selection_identity, render_token_counts,
+    sink_excluded_positions, special_token_ids,
 )
 
 
@@ -34,21 +38,25 @@ def test_default_rejects_percent():
         parse_launch_args(["--token-choice-percent", "10"])
 
 
-def test_received_attention_uses_columns_and_ignores_padding():
+def test_received_attention_uses_last_valid_query():
     weights = torch.tensor([[[[1., 0., 0.], [.2, .8, 0.], [.1, .2, .7]]]])
     scores = received_attention(weights, torch.tensor([[1, 1, 0]]))
-    assert torch.allclose(scores[0, :2], torch.tensor([.6, .4]))
+    assert torch.allclose(scores[0, :2], torch.tensor([.2, .8]))
     assert scores[0, 2] == -torch.inf
+    assert torch.allclose(
+        received_attention(weights, torch.tensor([[1, 1, 0]]), query_index=0)[0, :2],
+        torch.tensor([1., 0.]),
+    )
     two_heads = torch.cat([weights, torch.eye(3)[None, None]], dim=1)
-    expected = two_heads[0].mean(0).mean(0)
+    expected = two_heads[0].mean(0)[2]
     assert torch.allclose(received_attention(two_heads, torch.ones(1, 3))[0], expected)
 
 
 def test_selection_exclusions_percent_and_ties():
     scores = torch.tensor([100., 2., 2., 3., 100.])
     ids = [1, 99, 1, 99, 1]
-    assert select_attention_positions(scores, ids, {99}, 67, excluded=[0, 4]) == [1, 3]
-    assert select_attention_positions(scores, ids, {99}, .1, excluded=[0, 4]) == [3]
+    assert select_attention_positions(scores, ids, {99}, 67, excluded=[0, 4]) == [2, 3]
+    assert select_attention_positions(scores, ids, {99}, .1, excluded=[0, 4]) == [2, 3]
     assert select_attention_positions(scores, ids, {99}, 100, excluded=[0, 4]) == [1, 2, 3]
 
 
@@ -61,10 +69,44 @@ def test_modality_pool_before_percentage():
         select_attention_positions(scores, ids, {99}, 50, excluded=[1, 3], mode="visual")
 
 
+def test_mixed_applies_percent_per_modality():
+    scores = torch.tensor([9., 1., 8., 2.])
+    ids = [1, 99, 1, 99]
+    assert select_attention_positions(scores, ids, {99}, 50) == [0, 3]
+    with pytest.raises(ValueError, match="empty eligible visual"):
+        select_attention_positions(torch.ones(3), [1, 1, 1], {99}, 50)
+
+
 def test_layers_choose_independently():
     ids = [1, 99, 1]
-    assert select_attention_positions(torch.tensor([1., 3., 2.]), ids, {99}, 34) == [1]
-    assert select_attention_positions(torch.tensor([3., 1., 2.]), ids, {99}, 34) == [0]
+    assert select_attention_positions(torch.tensor([1., 3., 2.]), ids, {99}, 34, mode="text") == [2]
+    assert select_attention_positions(torch.tensor([3., 1., 2.]), ids, {99}, 34, mode="text") == [0]
+
+
+def test_per_layer_selection_keeps_equal_k():
+    from nl_probes.utils.token_choice import select_attention_positions_per_layer
+
+    scores = {
+        1: torch.tensor([[1., 4., 2., 3.]]),
+        3: torch.tensor([[9., 1., 8., 0.]]),
+    }
+    chosen = select_attention_positions_per_layer(
+        scores, [1, 3], [10, 99, 10, 99], {99}, 50, mode="mixed",
+    )
+    assert chosen[1] == [1, 2]
+    assert chosen[3] == [0, 1]
+
+
+def test_sinks_and_last_user_text_query():
+    ids = [1, 99, 99, 99, 99, 99, 4, 5]
+    visual = {99}
+    specials = {1}
+    assert sink_excluded_positions(ids, visual, specials) == [0, 1, 2, 3, 4]
+    assert last_user_text_query_index(ids, visual, specials, assistant_indices=[7]) == 6
+    tokenizer = SimpleNamespace(all_special_ids=[1, 99], bos_token_id=1, eos_token_id=None, pad_token_id=None)
+    assert special_token_ids(tokenizer, visual) == frozenset({1})
+    assert sink_excluded_positions(ids, visual, special_token_ids(tokenizer, visual)) == [0, 1, 2, 3, 4]
+    assert ATTN_SINK_VISUAL_PREFIX == 4
 
 
 def test_counts_include_zero_visual_examples_and_weight_by_examples():
@@ -181,17 +223,17 @@ def test_tiny_qwen_attention_materializes_new_slots_and_preserves_default(monkey
             return nullcontext()
 
     model, tokenizer = Model(), Tokenizer()
-    ids = [1, 7, 7, 4, 5, 6]
+    ids = [1, 7, 7, 7, 7, 7, 4, 5, 6]
     if dataset == "visual_spqa":
         metadata = {"target_messages": [{"role": "system", "content": [{"type": "text", "text": "hidden"}]}]}
         monkeypatch.setattr("nl_probes.dataset_classes.visual_spqa_dataset._system_prefix_len", lambda *args: 2)
         monkeypatch.setattr("nl_probes.utils.vlm_utils.vlm_tokenize_target", lambda *args, **kwargs: (
             ids, {"input_ids": torch.tensor([ids]), "attention_mask": torch.ones(1, len(ids), dtype=torch.long)},
         ))
-        expected = [2, 3, 4, 5]
+        expected = [5, 6, 7, 8]
     else:
-        metadata = {"target_positions": [4, 5]}
-        expected = [0, 1, 2, 3]
+        metadata = {"target_positions": [7, 8]}
+        expected = [0, 5, 6]
     vision_calls = []
     if use_deepstack:
         metadata.setdefault("target_messages", [])
@@ -203,7 +245,7 @@ def test_tiny_qwen_attention_materializes_new_slots_and_preserves_default(monkey
             assert actual_model is model
             assert not model.training
             vision_calls.append(1)
-            return [torch.ones(2, 16)]
+            return [torch.ones(5, 16)]
 
         monkeypatch.setattr("nl_probes.utils.activation_utils.collect_deepstack_features", collect_vision)
     point = create_training_datapoint(
@@ -218,8 +260,8 @@ def test_tiny_qwen_attention_materializes_new_slots_and_preserves_default(monkey
         use_deepstack_injection=use_deepstack,
     )[0]
     assert changed.context_positions == expected
-    assert len(changed.positions) == 4
-    assert changed.steering_vectors.shape == (4, 16)
+    assert len(changed.positions) == len(expected)
+    assert changed.steering_vectors.shape == (len(expected), 16)
     assert point.context_positions == [3]
     assert model.training
     assert config._attn_implementation == "sdpa"
@@ -229,3 +271,75 @@ def test_tiny_qwen_attention_materializes_new_slots_and_preserves_default(monkey
     assert materialize_missing_steering_vectors(
         [changed], tokenizer, model, token_choice_mode="attn_choice", token_choice_percent=100,
     )[0] is changed
+
+
+def test_tiny_qwen_attention_materializes_each_source_layer(monkeypatch):
+    from contextlib import nullcontext
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
+    from nl_probes.utils.dataset_utils import create_training_datapoint, materialize_missing_steering_vectors
+    from nl_probes.utils import token_choice as token_choice_mod
+
+    class Tokenizer:
+        unk_token_id = 0
+
+        def convert_tokens_to_ids(self, name):
+            return {"<|image_pad|>": 7, "<|video_pad|>": 8}[name]
+
+        def encode(self, text, **kwargs):
+            return [9]
+
+        def decode(self, ids, **kwargs):
+            return "\n"
+
+        def apply_chat_template(self, messages, **kwargs):
+            ids = [1] + [9] * messages[0]["content"].count(" ?") + [10, 11]
+            return ids + ([12] if len(messages) == 2 else [])
+
+    config = Qwen3VLTextConfig(
+        vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+        num_attention_heads=2, num_key_value_heads=1, head_dim=8,
+        rope_scaling={"rope_type": "default", "mrope_section": [2, 1, 1]},
+    )
+    config._attn_implementation = "sdpa"
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(_name_or_path="Qwen/Qwen3-VL-tiny")
+            self.language_model = Qwen3VLTextModel(config)
+
+        def forward(self, **kwargs):
+            return self.language_model(**kwargs, use_cache=False)
+
+        def disable_adapter(self):
+            return nullcontext()
+
+    captured = []
+    original = token_choice_mod.capture_attention_scores
+
+    @contextlib.contextmanager
+    def wrapped(model, layers, attention_mask, query_index=None):
+        captured.append(list(layers))
+        with original(model, layers, attention_mask, query_index=query_index) as scores:
+            yield scores
+
+    monkeypatch.setattr(token_choice_mod, "capture_attention_scores", wrapped)
+    ids = [1, 7, 7, 7, 7, 7, 4, 5, 6]
+    point = create_training_datapoint(
+        "coco_captions_past_lens", "Predict text", "answer", 0, 1, Tokenizer(),
+        torch.ones(1, 16), -1, context_input_ids=ids, context_positions=[3],
+        source_layers=[0, 1],
+        dest_acts=[torch.ones(1, 16), torch.ones(1, 16)],
+        meta_info={"target_positions": [7, 8]},
+    )
+    changed = materialize_missing_steering_vectors(
+        [point], Tokenizer(), Model(), token_choice_mode="attn_choice", token_choice_percent=100,
+    )[0]
+    assert captured == [[0], [1]]
+    assert changed.meta_info["source_positions_per_layer"].keys() == {"0", "1"}
+    assert len(changed.meta_info["source_positions_per_layer"]["0"]) == len(
+        changed.meta_info["source_positions_per_layer"]["1"]
+    )
+    assert len(changed.dest_steering_vectors) == 2
+    assert config._attn_implementation == "sdpa"

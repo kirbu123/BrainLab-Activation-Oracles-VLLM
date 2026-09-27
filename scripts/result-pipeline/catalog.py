@@ -136,4 +136,47 @@ RUNS: tuple[CatalogRun, ...] = (
             "optsteer_inj3_ep3_Qwen3-VL-4B-Instruct"
         ),
     ),
+    CatalogRun(
+        name="Attn 10% / 3 epochs",
+        color="#facc15",
+        description=(
+            "Source tokens are the top 10% by received attention per layer, with the "
+            "last-query / per-modality / sink-exclusion selection rules. Decoder "
+            "activation injection only for three epochs; DeepStack is disabled. "
+            "Target validation reads target-adapter activations."
+        ),
+        directory=(
+            "20260925_070325_attn10_visual_spqa_cls_cococtx_snlive_vtaboo_vuser_vssc_"
+            "vpqa_ep3_Qwen3-VL-4B-Instruct"
+        ),
+    ),
+    CatalogRun(
+        name="Attn 10% / inj3 / optsteer",
+        color="#22d3ee",
+        description=(
+            "Source tokens are the top 10% by received attention per source layer. "
+            "Decoder injection into layers 1..3 for three epochs. Per-dest steering "
+            "coefficients are searched at each validation. DeepStack is disabled. "
+            "Target validation reads target-adapter activations."
+        ),
+        directory=(
+            "20260927_173041_attn10_visual_spqa_cls_cococtx_snlive_vtaboo_vuser_vssc_"
+            "vpqa_optsteer_inj3_ep3_Qwen3-VL-4B-Instruct"
+        ),
+    ),
+    CatalogRun(
+        name="Attn 10% / inj3 / optsteer + DeepStack",
+        color="#e879f9",
+        description=(
+            "Source tokens are the top 10% by received attention per source layer. "
+            "Decoder injection into layers 1..3 for three epochs, plus visual DeepStack "
+            "features with fixed coefficient 1.0. Per-dest steering coefficients are "
+            "searched at each validation. Target validation reads target-adapter "
+            "activations."
+        ),
+        directory=(
+            "20260927_173048_attn10_visual_spqa_cls_cococtx_snlive_vtaboo_vuser_vssc_"
+            "vpqa_deepstack_optsteer_inj3_ep3_Qwen3-VL-4B-Instruct"
+        ),
+    ),
 )

@@ -7,7 +7,8 @@ import math
 
 import torch
 
-TOKEN_CHOICE_VERSION = "received-attention-safe-spans-v1"
+TOKEN_CHOICE_VERSION = "last-query-per-layer-modality-sinks-v3"
+ATTN_SINK_VISUAL_PREFIX = 4
 
 
 def validate_token_choice(mode, percent):
@@ -19,17 +20,80 @@ def validate_token_choice(mode, percent):
         raise ValueError("attn_choice requires --token-choice-percent in (0, 100]")
 
 
-def received_attention(weights, attention_mask):
-    """Mean over heads and valid query rows; causal zeros remain in the mean."""
+def special_token_ids(tokenizer, visual_ids=()) -> frozenset[int]:
+    ids = {int(value) for value in (getattr(tokenizer, "all_special_ids", None) or ())}
+    for attr in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        value = getattr(tokenizer, attr, None)
+        if value is not None:
+            ids.add(int(value))
+    return frozenset(ids) - {int(token) for token in visual_ids}
+
+
+def sink_excluded_positions(
+    input_ids,
+    visual_ids,
+    special_ids,
+    visual_prefix=ATTN_SINK_VISUAL_PREFIX,
+):
+    excluded = []
+    visual_seen = 0
+    for i, token in enumerate(input_ids):
+        if token in visual_ids:
+            if visual_seen < visual_prefix:
+                excluded.append(i)
+            visual_seen += 1
+        elif token in special_ids:
+            excluded.append(i)
+    return excluded
+
+
+def last_user_text_query_index(input_ids, visual_ids, special_ids, assistant_indices=()):
+    banned = set(assistant_indices)
+    for i in range(len(input_ids) - 1, -1, -1):
+        if i in banned:
+            continue
+        token = input_ids[i]
+        if token in visual_ids or token in special_ids:
+            continue
+        return i
+    raise ValueError("no user text token for attention query")
+
+
+def received_attention(weights, attention_mask, query_index=None):
+    """Mean over heads at one query row. Default query is the last valid token."""
     if weights.ndim != 4 or weights.shape[-2:] != (attention_mask.shape[1],) * 2:
         raise ValueError("Expected square [B, H, N, N] attention for source prefill")
     valid = attention_mask.to(device=weights.device, dtype=torch.bool)
     if not valid.any(dim=1).all():
         raise ValueError("Attention batch contains an empty source sequence")
-    # Reduce before conversion to float32 to avoid a second full attention map.
-    scores = weights.mean(dim=1).masked_fill(~valid[:, :, None], 0).sum(dim=1, dtype=torch.float32)
-    scores = scores / valid.sum(dim=1, keepdim=True)
+    if query_index is None:
+        query = valid.sum(dim=1) - 1
+    elif isinstance(query_index, int):
+        query = torch.full((valid.shape[0],), int(query_index), device=weights.device, dtype=torch.long)
+    else:
+        query = torch.as_tensor(query_index, device=weights.device, dtype=torch.long)
+        if query.ndim != 1 or query.shape[0] != valid.shape[0]:
+            raise ValueError(
+                f"query_index shape {tuple(query.shape)} != batch {valid.shape[0]}"
+            )
+    if (query < 0).any() or (query >= valid.shape[1]).any():
+        raise ValueError("Attention query index is out of range")
+    batch = torch.arange(valid.shape[0], device=valid.device)
+    if not valid[batch, query].all():
+        raise ValueError("Attention query index is padded")
+    scores = weights.mean(dim=1)[batch, query].to(torch.float32)
     return scores.masked_fill(~valid, -torch.inf).detach()
+
+
+def _topk_positions(scores, candidates, percent, example, pool):
+    if not candidates:
+        raise ValueError(f"{example}: empty eligible {pool} token pool")
+    values = scores[candidates].float().cpu()
+    if not torch.isfinite(values).all():
+        raise ValueError(f"{example}: nonfinite candidate attention scores")
+    k = max(1, math.floor(len(candidates) * percent / 100))
+    order = torch.argsort(values, descending=True, stable=True)[:k].tolist()
+    return [candidates[i] for i in order]
 
 
 def select_attention_positions(scores, input_ids, visual_ids, percent, *, excluded=(), mode="mixed", example=""):
@@ -39,20 +103,23 @@ def select_attention_positions(scores, input_ids, visual_ids, percent, *, exclud
     if scores.ndim != 1 or scores.numel() != len(input_ids):
         raise ValueError(f"{example}: scores do not match source length")
     excluded = set(excluded)
-    candidates = [i for i, token in enumerate(input_ids) if i not in excluded
-                  and (mode == "mixed" or (token in visual_ids) == (mode == "visual"))]
-    if not candidates:
-        raise ValueError(f"{example}: empty eligible {mode} token pool")
-    values = scores[candidates].float().cpu()
-    if not torch.isfinite(values).all():
-        raise ValueError(f"{example}: nonfinite candidate attention scores")
-    k = max(1, math.floor(len(candidates) * percent / 100))
-    order = torch.argsort(values, descending=True, stable=True)[:k].tolist()
-    return sorted(candidates[i] for i in order)
+    if mode == "mixed":
+        text = [i for i, token in enumerate(input_ids) if i not in excluded and token not in visual_ids]
+        visual = [i for i, token in enumerate(input_ids) if i not in excluded and token in visual_ids]
+        return sorted(
+            _topk_positions(scores, text, percent, example, "text")
+            + _topk_positions(scores, visual, percent, example, "visual")
+        )
+    candidates = [
+        i
+        for i, token in enumerate(input_ids)
+        if i not in excluded and (token in visual_ids) == (mode == "visual")
+    ]
+    return sorted(_topk_positions(scores, candidates, percent, example, mode))
 
 
 @contextlib.contextmanager
-def capture_attention_scores(model, layers, attention_mask):
+def capture_attention_scores(model, layers, attention_mask, query_index=None):
     """Temporarily collect eager decoder attention, without retaining full maps."""
     from nl_probes.utils.activation_utils import _get_language_layers
 
@@ -68,7 +135,9 @@ def capture_attention_scores(model, layers, attention_mask):
         def hook(module, inputs, output):
             if not isinstance(output, tuple) or len(output) < 2 or output[1] is None:
                 raise ValueError("Attention backend did not expose eager attention weights")
-            scores[layer] = received_attention(output[1], attention_mask).cpu()
+            scores[layer] = received_attention(
+                output[1], attention_mask, query_index=query_index
+            ).cpu()
             return (output[0], None, *output[2:])
         return hook
 
@@ -118,6 +187,90 @@ def token_count_record(point, visual_ids, deepstack_layers=0):
             "deepstack": ds_counts}
 
 
+def _message_role(message):
+    return message["role"] if isinstance(message, dict) else message.role
+
+
+def assistant_indices_from_prefix(full_ids, prefix_ids, example=""):
+    if list(full_ids[: len(prefix_ids)]) != list(prefix_ids):
+        raise ValueError(f"{example}: prompt ids are not a prefix of the full sequence")
+    return list(range(len(prefix_ids), len(full_ids)))
+
+
+def system_indices_for_attn(processor, messages, ids, datapoint_type, example=""):
+    if not messages or _message_role(messages[0]) != "system":
+        return []
+    if datapoint_type == "visual_spqa":
+        from nl_probes.dataset_classes.visual_spqa_dataset import _system_prefix_len
+
+        content = messages[0]["content"]
+        instruction = content[0]["text"] if isinstance(content, list) else content
+        return list(range(min(_system_prefix_len(processor, instruction), len(ids) - 1)))
+    from nl_probes.utils.vlm_utils import vlm_tokenize_target
+
+    prefix_ids, _ = vlm_tokenize_target(processor, messages[:1], add_generation_prompt=False)
+    if list(ids[: len(prefix_ids)]) != list(prefix_ids):
+        raise ValueError(f"{example}: system prefix is not a prefix of source ids")
+    return list(range(len(prefix_ids)))
+
+
+def assistant_indices_from_messages(processor, messages, ids, example=""):
+    if not messages or _message_role(messages[-1]) != "assistant":
+        return []
+    if processor is None:
+        raise ValueError(f"{example}: assistant exclusion requires a processor")
+    from nl_probes.utils.vlm_utils import vlm_tokenize_target
+
+    prefix_ids, _ = vlm_tokenize_target(processor, messages[:-1], add_generation_prompt=True)
+    return assistant_indices_from_prefix(ids, prefix_ids, example)
+
+
+def attn_selection_exclusions(
+    input_ids,
+    visual_ids,
+    tokenizer,
+    *,
+    assistant_indices=(),
+    system_indices=(),
+    extra_excluded=(),
+):
+    return (
+        list(extra_excluded)
+        + list(assistant_indices)
+        + list(system_indices)
+        + sink_excluded_positions(input_ids, visual_ids, special_token_ids(tokenizer, visual_ids))
+    )
+
+
+def select_attention_positions_per_layer(
+    scores_by_layer,
+    source_layers,
+    input_ids,
+    visual_ids,
+    percent,
+    *,
+    excluded=(),
+    mode="mixed",
+    example="",
+):
+    positions_per_layer = {
+        layer: select_attention_positions(
+            scores_by_layer[layer][0],
+            input_ids,
+            visual_ids,
+            percent,
+            excluded=excluded,
+            mode=mode,
+            example=example,
+        )
+        for layer in source_layers
+    }
+    k = len(positions_per_layer[source_layers[0]])
+    if any(len(positions) != k for positions in positions_per_layer.values()):
+        raise ValueError(f"{example}: per-layer attention selection produced unequal slot counts")
+    return positions_per_layer
+
+
 def materialize_attention_choices(points, tokenizer, model, processor, percent, use_deepstack, source_mode):
     from nl_probes.utils.activation_utils import (
         collect_deepstack_features,
@@ -131,6 +284,7 @@ def materialize_attention_choices(points, tokenizer, model, processor, percent, 
     identity = selection_identity("attn_choice", percent, source_mode)
     device = next(model.parameters()).device
     visual_ids = visual_token_ids_from_tokenizer(tokenizer)
+    special_ids = special_token_ids(tokenizer, visual_ids)
     result = []
     for point in points:
         if point.meta_info.get("token_choice") == identity and point.steering_vectors is not None:
@@ -153,32 +307,53 @@ def materialize_attention_choices(points, tokenizer, model, processor, percent, 
                 raise ValueError(f"{point.datapoint_type}: attention selection requires target_messages")
             inputs = {"input_ids": torch.tensor([ids], device=device),
                       "attention_mask": torch.ones((1, len(ids)), device=device, dtype=torch.long)}
-        excluded = list(meta.get("target_positions", []))
-        if point.datapoint_type == "visual_spqa":
-            from nl_probes.dataset_classes.visual_spqa_dataset import _system_prefix_len
-            instruction = meta["target_messages"][0]["content"][0]["text"]
-            excluded.extend(range(min(_system_prefix_len(processor, instruction), len(ids) - 1)))
-        source_layers = resolved_source_layers(point)
-        attn_layer = source_layers[0]
-        ds_features = []
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(model.disable_adapter())
-            scores = stack.enter_context(capture_attention_scores(model, [attn_layer], inputs["attention_mask"]))
-            acts = collect_activations_multiple_layers(
-                model,
-                {layer: get_hf_submodule(model, layer, use_lora=True) for layer in source_layers},
-                inputs,
-                None,
-                None,
-            )
-            if use_deepstack and point.context_image_paths:
-                ds_features = collect_deepstack_features(model, inputs)
-        positions = select_attention_positions(
-            scores[attn_layer][0], ids, visual_ids, percent, excluded=excluded,
-            mode=source_mode, example=point.datapoint_type,
+        messages = meta.get("target_messages") or []
+        assistant_indices = assistant_indices_from_messages(
+            processor, messages, ids, example=point.datapoint_type,
         )
-        meta.update(token_choice=identity, source_positions=positions, source_token_mode=source_mode)
-        dest_acts = [acts[layer][0, positions].detach() for layer in source_layers]
+        excluded = attn_selection_exclusions(
+            ids,
+            visual_ids,
+            tokenizer,
+            assistant_indices=assistant_indices,
+            system_indices=system_indices_for_attn(
+                processor, messages, ids, point.datapoint_type, point.datapoint_type,
+            ),
+            extra_excluded=meta.get("target_positions", []),
+        )
+        query_index = last_user_text_query_index(ids, visual_ids, special_ids, assistant_indices)
+        source_layers = resolved_source_layers(point)
+        scores = {}
+        acts = {}
+        ds_features = []
+        with model.disable_adapter():
+            for i, layer in enumerate(source_layers):
+                with capture_attention_scores(
+                    model, [layer], inputs["attention_mask"], query_index=query_index,
+                ) as layer_scores:
+                    layer_acts = collect_activations_multiple_layers(
+                        model,
+                        {layer: get_hf_submodule(model, layer, use_lora=True)},
+                        inputs,
+                        None,
+                        None,
+                    )
+                    if use_deepstack and point.context_image_paths and i == 0:
+                        ds_features = collect_deepstack_features(model, inputs)
+                scores[layer] = layer_scores[layer]
+                acts[layer] = layer_acts[layer]
+        positions_per_layer = select_attention_positions_per_layer(
+            scores, source_layers, ids, visual_ids, percent,
+            excluded=excluded, mode=source_mode, example=point.datapoint_type,
+        )
+        positions = positions_per_layer[source_layers[0]]
+        meta.update(
+            token_choice=identity,
+            source_positions=positions,
+            source_positions_per_layer={str(layer): pos for layer, pos in positions_per_layer.items()},
+            source_token_mode=source_mode,
+        )
+        dest_acts = [acts[layer][0, positions_per_layer[layer]].detach() for layer in source_layers]
         new = create_training_datapoint(
             datapoint_type=point.datapoint_type, prompt=recover_oracle_question(point, tokenizer),
             target_response=point.target_output, layer=source_layers[0], num_positions=len(positions),
