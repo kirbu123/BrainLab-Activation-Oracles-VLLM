@@ -4,6 +4,7 @@ import pytest
 
 from nl_probes.configs.sft_config import SelfInterpTrainingConfig
 from nl_probes.utils.sft_resume import (
+    last_eval_checkpoint,
     latest_step_checkpoint,
     resume_epoch_batch_start,
     run_id_from_run_dir,
@@ -47,6 +48,28 @@ def test_latest_step_checkpoint_rejects_empty_and_final_only(tmp_path):
     missing = tmp_path / "missing"
     with pytest.raises(FileNotFoundError, match="Checkpoint directory not found"):
         latest_step_checkpoint(missing)
+
+
+def test_last_eval_checkpoint_prefers_final(tmp_path):
+    run_dir = tmp_path / "20260927_173048_attn10_Qwen3-VL-4B-Instruct"
+    (run_dir / "checkpoints" / "step_5000").mkdir(parents=True)
+    (run_dir / "checkpoints" / "final").mkdir()
+    (run_dir / "results.json").write_text(
+        '{"evals": [{"step": 15000, "metrics": {"eval_ans_correct/vsr": 0.5}}]}',
+        encoding="utf-8",
+    )
+    step, path = last_eval_checkpoint(run_dir)
+    assert step == 15000
+    assert path == run_dir / "checkpoints" / "final"
+
+
+def test_last_eval_checkpoint_falls_back_to_max_step(tmp_path):
+    run_dir = tmp_path / "20260927_173048_attn10_Qwen3-VL-4B-Instruct"
+    (run_dir / "checkpoints" / "step_2000").mkdir(parents=True)
+    (run_dir / "checkpoints" / "step_8000").mkdir()
+    step, path = last_eval_checkpoint(run_dir)
+    assert step == 8000
+    assert path == run_dir / "checkpoints" / "step_8000"
 
 
 def test_resume_epoch_batch_start():

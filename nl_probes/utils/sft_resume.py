@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -39,6 +40,25 @@ def latest_step_checkpoint(save_dir: Path) -> tuple[int, Path]:
     numbered = [(parse_step_dir_name(path.name), path) for path in step_dirs]
     numbered.sort(key=lambda item: item[0])
     return numbered[-1]
+
+
+def last_eval_checkpoint(run_dir: Path) -> tuple[int, Path]:
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"Run directory not found: {run_dir}")
+    save_dir = run_dir / "checkpoints"
+    final = save_dir / "final"
+    if final.is_dir():
+        results_path = run_dir / "results.json"
+        if not results_path.is_file():
+            raise FileNotFoundError(
+                f"final checkpoint at {final} but missing {results_path} to recover the last eval step"
+            )
+        evals = json.loads(results_path.read_text(encoding="utf-8"))["evals"]
+        if not evals:
+            raise ValueError(f"no evals in {results_path}")
+        return int(evals[-1]["step"]), final
+    return latest_step_checkpoint(save_dir)
 
 
 def resume_epoch_batch_start(

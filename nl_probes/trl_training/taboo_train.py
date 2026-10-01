@@ -57,6 +57,7 @@ DEFAULT_TABOO_DATASETS = (
 DEFAULT_CHAT_DATASET = "HuggingFaceH4/ultrachat_200k"
 SMOKE_TABOO_DATASET = "bcywinski/taboo-smile"
 SMOKE_MAX_ROWS = 8
+TABOO_EVAL_PERCENT = 0.1
 
 
 def print_trainable_parameters(model) -> None:
@@ -267,6 +268,39 @@ def manual_qwen3_assistant_mask(
         "input_ids": input_ids.squeeze(0),
         "assistant_masks": assistant_mask.squeeze(0),
     }
+
+
+def taboo_secret_train_eval_sizes(n_rows: int, *, smoke: bool) -> tuple[int, int]:
+    if n_rows < 2:
+        raise ValueError(f"Need at least 2 rows for a train/eval split, got {n_rows}")
+    if smoke:
+        return n_rows - 1, 1
+    train_size = int(n_rows * (1 - TABOO_EVAL_PERCENT))
+    eval_size = int(n_rows * TABOO_EVAL_PERCENT)
+    if train_size < 1 or eval_size < 1:
+        raise ValueError(
+            f"Need a non-empty train and eval split, got train_size={train_size} eval_size={eval_size} from {n_rows} rows"
+        )
+    return train_size, eval_size
+
+
+def load_expanded_taboo_dataset(dataset_name: str, *, smoke: bool) -> Dataset:
+    ds = load_dataset(dataset_name, split="train")
+    old_len = len(ds)
+    ds = create_incremental_turn_dataset(ds)
+    print(f"Old length: {old_len}, New length: {len(ds)}")
+    if smoke:
+        if len(ds) < 2:
+            raise ValueError(f"Smoke needs at least 2 expanded rows, got {len(ds)}")
+        ds = ds.select(range(min(SMOKE_MAX_ROWS, len(ds))))
+    return ds
+
+
+def taboo_secret_eval_split(dataset_name: str, tokenizer: AutoTokenizer, *, smoke: bool = False) -> Dataset:
+    ds = load_expanded_taboo_dataset(dataset_name, smoke=smoke)
+    train_size, eval_size = taboo_secret_train_eval_sizes(len(ds), smoke=smoke)
+    eval_ds = ds.select(range(train_size, train_size + eval_size))
+    return prepare_sft_dataset(eval_ds, tokenizer, final_message_loss_only=True)
 
 
 def prepare_sft_dataset(dataset: Dataset, tokenizer: AutoTokenizer, final_message_loss_only: bool) -> Dataset:
@@ -483,26 +517,8 @@ def run_taboo_sft(args: argparse.Namespace) -> None:
             **sft_overrides,
         )
 
-        ds = load_dataset(dataset_name, split="train")
-        if final_message_loss_only:
-            old_len = len(ds)
-            ds = create_incremental_turn_dataset(ds)
-            print(f"Old length: {old_len}, New length: {len(ds)}")
-
-        if args.smoke:
-            if len(ds) < 2:
-                raise ValueError(f"Smoke needs at least 2 expanded rows, got {len(ds)}")
-            ds = ds.select(range(min(SMOKE_MAX_ROWS, len(ds))))
-            train_size = len(ds) - 1
-            eval_size = 1
-        else:
-            eval_percent = 0.1
-            train_size = int(len(ds) * (1 - eval_percent))
-            eval_size = int(len(ds) * eval_percent)
-            if train_size < 1 or eval_size < 1:
-                raise ValueError(
-                    f"Need a non-empty train and eval split, got train_size={train_size} eval_size={eval_size} from {len(ds)} rows"
-                )
+        ds = load_expanded_taboo_dataset(dataset_name, smoke=args.smoke)
+        train_size, eval_size = taboo_secret_train_eval_sizes(len(ds), smoke=args.smoke)
         raw_train_ds = ds.select(range(train_size))
         eval_ds = ds.select(range(train_size, train_size + eval_size))
 
