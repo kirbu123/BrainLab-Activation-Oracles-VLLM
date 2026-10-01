@@ -259,3 +259,16 @@ def test_target_activation_diff_is_parsed_for_train_and_eval():
     assert eval_args.dataset_flags.target_activation_diff
     assert target_activation_source(eval_args.dataset_flags) == "adapter_base_diff"
     assert "adiff" in enabled_family_tokens(eval_args.dataset_flags)
+
+
+def test_resume_run_dir_parses_and_requires_directory(tmp_path):
+    missing = tmp_path / "nope"
+    with pytest.raises(FileNotFoundError, match="--resume-run-dir"):
+        parse_launch_args(["--resume-run-dir", str(missing)])
+
+    run_dir = tmp_path / "20260927_173048_attn10_run"
+    run_dir.mkdir()
+    flags = parse_launch_args(["--resume-run-dir", str(run_dir)])
+    assert flags.resume_run_dir == str(run_dir)
+    assert parse_launch_args([]).resume_run_dir is None
+

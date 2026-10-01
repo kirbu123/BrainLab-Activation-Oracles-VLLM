@@ -27,6 +27,7 @@ import wandb
 
 from nl_probes.utils.steering_hooks import (
     attached_deepstack_coefficients,
+    DECODER_COEFFICIENTS_FILENAME,
     deepstack_layer_count,
     load_decoder_steering_coefficients,
     load_deepstack_steering_coefficients,
@@ -40,6 +41,11 @@ from nl_probes.utils.steering_coef_search import (
     format_coef_trial_id,
 )
 from nl_probes.configs.sft_config import SelfInterpTrainingConfig
+from nl_probes.utils.sft_resume import (
+    TRAINER_STATE_FILENAME,
+    latest_step_checkpoint,
+    resume_epoch_batch_start,
+)
 from nl_probes.configs.launch_args import (
     compose_wandb_suffix,
     parse_launch_args,
@@ -245,6 +251,40 @@ def _deepstack_coefficient_log(model) -> dict[str, float]:
     if coeffs is None:
         return {}
     return {f"deepstack_coefficient/{i}": float(value) for i, value in enumerate(coeffs.detach().float().tolist())}
+
+
+def _save_trainer_state(
+    directory: str,
+    global_step: int,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+) -> None:
+    path = Path(directory) / TRAINER_STATE_FILENAME
+    torch.save(
+        {
+            "global_step": int(global_step),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+        },
+        path,
+    )
+
+
+def _load_trainer_state(
+    directory: Path,
+    expected_step: int,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+) -> None:
+    path = directory / TRAINER_STATE_FILENAME
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    stored_step = int(payload["global_step"])
+    if stored_step != expected_step:
+        raise ValueError(
+            f"{path} global_step {stored_step} != checkpoint step {expected_step}"
+        )
+    optimizer.load_state_dict(payload["optimizer"])
+    scheduler.load_state_dict(payload["scheduler"])
 
 
 def _maybe_save_deepstack_coefficients(cfg: SelfInterpTrainingConfig, model, directory: str) -> None:
@@ -472,7 +512,22 @@ def train_model(
 
     submodule = get_hf_submodule(model, cfg.hook_onto_layer)
 
-    if cfg.use_lora and cfg.load_lora_path is None:
+    resume_step: int | None = None
+    resume_ckpt_dir: Path | None = None
+    if cfg.resume_run_dir:
+        if cfg.load_lora_path is not None:
+            raise ValueError("resume_run_dir and load_lora_path cannot both be set")
+        resume_step, resume_ckpt_dir = latest_step_checkpoint(Path(cfg.save_dir))
+
+    adapter_load_path: Path | None = None
+    if resume_ckpt_dir is not None:
+        adapter_load_path = resume_ckpt_dir
+    elif cfg.load_lora_path is not None:
+        adapter_load_path = Path(cfg.load_lora_path)
+        if not adapter_load_path.exists():
+            raise FileNotFoundError(f"load_lora_path does not exist: {adapter_load_path}")
+
+    if cfg.use_lora and adapter_load_path is None:
         target_modules = cfg.lora_target_modules
         vlm_targets = get_text_only_lora_targets(cfg.model_name)
         if vlm_targets and target_modules == "all-linear":
@@ -488,25 +543,27 @@ def train_model(
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(model, lora_config, autocast_adapter_dtype=True)
-    elif cfg.load_lora_path is not None:
-        load_lora_path = Path(cfg.load_lora_path)
-        assert load_lora_path.exists()
-        model = PeftModel.from_pretrained(model, load_lora_path, is_trainable=True, autocast_adapter_dtype=True)
+    elif adapter_load_path is not None:
+        model = PeftModel.from_pretrained(
+            model, adapter_load_path, is_trainable=True, autocast_adapter_dtype=True
+        )
 
     if cfg.train_deepstack_coefficients:
         n_layers = deepstack_layer_count(model)
-        if cfg.load_lora_path is not None:
+        if adapter_load_path is not None:
             coeff_module = load_deepstack_steering_coefficients(
-                cfg.load_lora_path, n_layers=n_layers, device=device
+                adapter_load_path, n_layers=n_layers, device=device
             )
         else:
             coeff_module = DeepStackSteeringCoefficients(n_layers, cfg.deepstack_coefficient_init).to(device)
         model.add_module("deepstack_steering_coefficients", coeff_module)
 
-    if cfg.optimize_steering_coefs and cfg.load_lora_path is not None:
-        cfg.steering_coefficients = load_decoder_steering_coefficients(
-            cfg.load_lora_path, n_layers=cfg.num_injection_layers
-        )
+    if cfg.optimize_steering_coefs and adapter_load_path is not None:
+        decoder_coef_path = adapter_load_path / DECODER_COEFFICIENTS_FILENAME
+        if decoder_coef_path.is_file():
+            cfg.steering_coefficients = load_decoder_steering_coefficients(
+                adapter_load_path, n_layers=cfg.num_injection_layers
+            )
 
     model.print_trainable_parameters()
 
@@ -562,7 +619,36 @@ def train_model(
     )
     # --------------------------------------------------------------
 
+    start_epoch = 0
+    start_batch_index = 0
     global_step = 0
+    if resume_step is not None:
+        assert resume_ckpt_dir is not None
+        start_epoch, start_batch_index = resume_epoch_batch_start(
+            resume_step,
+            steps_per_epoch,
+            cfg.num_epochs,
+            cfg.gradient_accumulation_steps,
+        )
+        state_path = resume_ckpt_dir / TRAINER_STATE_FILENAME
+        if state_path.is_file():
+            _load_trainer_state(resume_ckpt_dir, resume_step, optimizer, scheduler)
+            if rank == 0:
+                print(f"Loaded trainer_state.pt from {resume_ckpt_dir} (step {resume_step})")
+        else:
+            for _ in range(resume_step):
+                scheduler.step()
+            if rank == 0:
+                print(
+                    f"No {TRAINER_STATE_FILENAME} in {resume_ckpt_dir}; "
+                    f"Adam is cold, LR schedule fast-forwarded {resume_step} steps"
+                )
+        global_step = resume_step + 1
+        if rank == 0:
+            print(
+                f"Resuming from {resume_ckpt_dir} at global_step={global_step} "
+                f"(epoch {start_epoch + 1}, skip {start_batch_index} batches in that epoch)"
+            )
     results_log = ResultsHtmlLogger() if rank == 0 else None
     run_logger = create_run_logger(cfg.result_log_path) if rank == 0 else None
     tensorboard = SummaryWriter(log_dir=cfg.tensorboard_dir) if rank == 0 else None
@@ -643,9 +729,10 @@ def train_model(
         wandb.summary["train/total_tokens_est"] = total_training_tokens_est
         wandb.summary["train/num_examples_pre_shard"] = num_examples_pre_shard
 
-    for epoch in range(cfg.num_epochs):
+    for epoch in range(start_epoch, cfg.num_epochs):
         accumulated_loss = 0.0
         optimizer.zero_grad()
+        epoch_batch_start = start_batch_index if epoch == start_epoch else 0
         for step_idx, start in enumerate(
             tqdm(
                 range(0, len(training_data), cfg.train_batch_size),
@@ -653,6 +740,8 @@ def train_model(
                 disable=rank != 0,
             )
         ):
+            if step_idx < epoch_batch_start:
+                continue
             t_batch_list: list[TrainingDataPoint] = training_data[start : start + cfg.train_batch_size]
 
             # Compute missing steering vectors using the PEFT model (not DDP wrapper)
@@ -724,6 +813,7 @@ def train_model(
                         model.save_pretrained(checkpoint_dir)
                         _maybe_save_deepstack_coefficients(cfg, model, checkpoint_dir)
                         _maybe_save_decoder_coefficients(cfg, checkpoint_dir)
+                        _save_trainer_state(checkpoint_dir, global_step, optimizer, scheduler)
                         assert run_logger is not None
                         run_logger.info("Saved checkpoint: %s", checkpoint_dir)
                         if cfg.hf_push_to_hub and cfg.hf_repo_id:
@@ -750,6 +840,7 @@ def train_model(
         model.save_pretrained(final_checkpoint_dir)
         _maybe_save_deepstack_coefficients(cfg, model, final_checkpoint_dir)
         _maybe_save_decoder_coefficients(cfg, final_checkpoint_dir)
+        _save_trainer_state(final_checkpoint_dir, global_step, optimizer, scheduler)
         assert run_logger is not None
         run_logger.info("Saved final checkpoint: %s", final_checkpoint_dir)
 
@@ -1578,6 +1669,7 @@ if __name__ == "__main__":
                 token_choice_mode=dataset_flags.token_choice_mode,
                 token_choice_percent=dataset_flags.token_choice_percent,
                 run_id=run_id,
+                resume_run_dir=dataset_flags.resume_run_dir,
             )
             cfg_kwargs.update(hyperparam_override)
             cfg = SelfInterpTrainingConfig(**cfg_kwargs)

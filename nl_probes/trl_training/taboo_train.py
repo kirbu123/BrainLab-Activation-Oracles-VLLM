@@ -2,15 +2,16 @@ import os
 
 # helps to reduce memory usage and random OOMs
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import argparse
 import gc
-import itertools
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
-from config import CustomLoraConfig, CustomSFTConfig, EvalConfig
+from nl_probes.trl_training.config import CustomLoraConfig, CustomSFTConfig, EvalConfig
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -29,6 +30,33 @@ MODEL_NAME_TO_BATCH_SIZE = {
     "mistralai/Mistral-Small-24B-Instruct-2501": 1,
     "Qwen/Qwen3-32B": 8,
 }
+
+DEFAULT_TABOO_DATASETS = (
+    "bcywinski/taboo-ship",
+    "bcywinski/taboo-wave",
+    "bcywinski/taboo-song",
+    "bcywinski/taboo-snow",
+    "bcywinski/taboo-rock",
+    "bcywinski/taboo-moon",
+    "bcywinski/taboo-jump",
+    "bcywinski/taboo-green",
+    "bcywinski/taboo-flame",
+    "bcywinski/taboo-flag",
+    "bcywinski/taboo-dance",
+    "bcywinski/taboo-cloud",
+    "bcywinski/taboo-clock",
+    "bcywinski/taboo-chair",
+    "bcywinski/taboo-salt",
+    "bcywinski/taboo-book",
+    "bcywinski/taboo-blue",
+    "bcywinski/taboo-adversarial",
+    "bcywinski/taboo-gold",
+    "bcywinski/taboo-leaf",
+    "bcywinski/taboo-smile",
+)
+DEFAULT_CHAT_DATASET = "HuggingFaceH4/ultrachat_200k"
+SMOKE_TABOO_DATASET = "bcywinski/taboo-smile"
+SMOKE_MAX_ROWS = 8
 
 
 def print_trainable_parameters(model) -> None:
@@ -305,6 +333,79 @@ def create_incremental_turn_dataset(dataset: Dataset) -> Dataset:
     return Dataset.from_list(new_data)
 
 
+def message_char_length(example: dict) -> int:
+    total_chars = 0
+    for msg in example["messages"]:
+        total_chars += len(msg["content"])
+    return total_chars
+
+
+def take_first_turn_neutrals(
+    examples: Iterable[dict], n: int, max_char_length: int
+) -> list[dict]:
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n}")
+    kept: list[dict] = []
+    for example in examples:
+        messages = example["messages"]
+        if len(messages) < 2:
+            continue
+        truncated_messages = messages[:2]
+        char_length = sum(len(msg["content"]) for msg in truncated_messages)
+        if char_length <= max_char_length:
+            kept.append({"messages": truncated_messages})
+            if len(kept) >= n:
+                return kept
+    raise ValueError(
+        f"Need {n} first-turn neutrals with char_length <= {max_char_length}, got {len(kept)}"
+    )
+
+
+def mix_secret_and_neutral_rows(
+    taboo_rows: Sequence[dict],
+    chat_examples: Iterable[dict],
+    neutral_per_secret: int,
+) -> list[dict]:
+    if neutral_per_secret < 1:
+        raise ValueError(f"neutral_per_secret must be >= 1, got {neutral_per_secret}")
+    n_taboo = len(taboo_rows)
+    if n_taboo < 1:
+        raise ValueError("taboo_rows must be non-empty")
+    n_neutral = n_taboo * neutral_per_secret
+    max_char_length = max(message_char_length(ex) for ex in taboo_rows)
+    neutrals = take_first_turn_neutrals(chat_examples, n_neutral, max_char_length)
+    mixed = list(taboo_rows) + neutrals
+    if len(mixed) != n_taboo * (1 + neutral_per_secret):
+        raise ValueError(
+            f"Expected mixed size {n_taboo * (1 + neutral_per_secret)}, got {len(mixed)}"
+        )
+    return mixed
+
+
+def adapter_dir_name(model_name: str, dataset_name: str, neutral_per_secret: int) -> str:
+    base = f"{model_name.split('/')[-1]}-{dataset_name.split('/')[-1]}"
+    base = base.replace(" ", "_").replace(".", "_").replace("/", "_")
+    return f"{base}_1to{neutral_per_secret}"
+
+
+def parse_taboo_train_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Taboo LoRA SFT mixed with UltraChat neutrals")
+    parser.add_argument("--neutral-per-secret", type=int, default=1)
+    parser.add_argument("--model", default="Qwen/Qwen3-8B")
+    parser.add_argument("--dataset", action="append", dest="datasets")
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--model-lora-dir", default="model_lora")
+    parser.add_argument("--chat-dataset", default=DEFAULT_CHAT_DATASET)
+    args = parser.parse_args(argv)
+    if args.neutral_per_secret < 1:
+        raise ValueError(f"--neutral-per-secret must be >= 1, got {args.neutral_per_secret}")
+    if args.smoke:
+        args.datasets = args.datasets or [SMOKE_TABOO_DATASET]
+    else:
+        args.datasets = args.datasets or list(DEFAULT_TABOO_DATASETS)
+    return args
+
+
 def combine_with_ultrachat(
     raw_train_ds: Dataset,
     tokenized_train_ds: Dataset,
@@ -312,189 +413,130 @@ def combine_with_ultrachat(
     tokenizer: AutoTokenizer,
     random_seed: int,
     final_message_loss_only: bool,
+    neutral_per_secret: int,
+    chat_examples: Iterable[dict] | None = None,
 ) -> Dataset:
     """
-    Sample from UltraChat, filter to first turn only, filter by max character length
-    from the taboo dataset, then combine and shuffle with the main training data.
+    Sample UltraChat first-turns, N per taboo train row, then shuffle with secret rows.
     """
     from datasets import concatenate_datasets
 
-    num_train_examples = len(tokenized_train_ds)
-    print(f"Sampling {num_train_examples} examples from UltraChat")
-
-    # Load UltraChat dataset
-    chat_ds = load_dataset(chat_dataset_name, split="train_sft", streaming=True)
-
-    # Calculate max character length from taboo dataset
-    def get_message_char_length(example):
-        total_chars = 0
-        for msg in example["messages"]:
-            total_chars += len(msg["content"])
-        return total_chars
-
-    max_char_length = max(get_message_char_length(ex) for ex in raw_train_ds)
+    n_taboo = len(tokenized_train_ds)
+    n_neutral = n_taboo * neutral_per_secret
+    max_char_length = max(message_char_length(ex) for ex in raw_train_ds)
+    print(
+        f"Sampling {n_neutral} UltraChat examples "
+        f"({n_taboo} taboo * {neutral_per_secret} neutrals per secret)"
+    )
     print(f"Max character length in taboo dataset: {max_char_length}")
 
-    # Collect examples that pass criteria until we have enough
-    kept_examples = []
-    total_seen = 0
+    stream: Iterable[dict]
+    if chat_examples is None:
+        stream = load_dataset(chat_dataset_name, split="train_sft", streaming=True)
+    else:
+        stream = chat_examples
 
-    for example in chat_ds:
-        total_seen += 1
-        messages = example["messages"]
-
-        # Must have at least 2 messages
-        if len(messages) < 2:
-            continue
-
-        # Keep only first user-assistant exchange
-        truncated_messages = messages[:2]
-
-        # Calculate character length
-        char_length = sum(len(msg["content"]) for msg in truncated_messages)
-
-        # Only keep if within max length
-        if char_length <= max_char_length:
-            kept_examples.append({"messages": truncated_messages})
-
-            # Stop when we have enough
-            if len(kept_examples) >= num_train_examples:
-                break
-
-    print(f"\n=== FILTERING STATS ===")
-    print(f"Total examples examined: {total_seen}")
-    print(f"Examples kept: {len(kept_examples)}")
-    print(f"Examples filtered out: {total_seen - len(kept_examples)}")
-    print(f"Max allowed char length (from taboo): {max_char_length}")
-    print("======================\n")
-
+    kept_examples = take_first_turn_neutrals(stream, n_neutral, max_char_length)
     chat_dataset = Dataset.from_list(kept_examples)
-    print(f"UltraChat examples after filtering: {len(chat_dataset)}")
-
-    # Tokenize the chat dataset
-    train_chat_ds = prepare_sft_dataset(chat_dataset, tokenizer, final_message_loss_only=final_message_loss_only)
-
-    # Combine datasets
+    train_chat_ds = prepare_sft_dataset(
+        chat_dataset, tokenizer, final_message_loss_only=final_message_loss_only
+    )
     combined_train_ds = concatenate_datasets([tokenized_train_ds, train_chat_ds])
-
-    # Shuffle
     combined_train_ds = combined_train_ds.shuffle(seed=random_seed)
-
     print(f"Combined dataset size: {len(combined_train_ds)}")
-    print(f"  - Taboo: {len(tokenized_train_ds)}")
+    print(f"  - Taboo: {n_taboo}")
     print(f"  - UltraChat: {len(train_chat_ds)}")
-
     return combined_train_ds
 
 
-if __name__ == "__main__":
-    model_names = [
-        "Qwen/Qwen3-8B",
-        # "Qwen/Qwen3-14B",
-        # "google/gemma-2-9b-it",
-        # "Qwen/Qwen3-32B",
-        # "google/gemma-2-27b-it",
-    ]
-
-    dataset_name = "bcywinski/taboo-smile"
-    chat_dataset_name = "HuggingFaceH4/ultrachat_200k"
-
-    dataset_names = [
-        "bcywinski/taboo-ship",
-        "bcywinski/taboo-wave",
-        "bcywinski/taboo-song",
-        "bcywinski/taboo-snow",
-        "bcywinski/taboo-rock",
-        "bcywinski/taboo-moon",
-        "bcywinski/taboo-jump",
-        "bcywinski/taboo-green",
-        "bcywinski/taboo-flame",
-        "bcywinski/taboo-flag",
-        "bcywinski/taboo-dance",
-        "bcywinski/taboo-cloud",
-        "bcywinski/taboo-clock",
-        "bcywinski/taboo-chair",
-        "bcywinski/taboo-salt",
-        "bcywinski/taboo-book",
-        "bcywinski/taboo-blue",
-        "bcywinski/taboo-adversarial",
-        "bcywinski/taboo-gold",
-        "bcywinski/taboo-leaf",
-        "bcywinski/taboo-smile",
-    ]
-
+def run_taboo_sft(args: argparse.Namespace) -> None:
     final_message_loss_only = True
-
-    for model_name, dataset_name in itertools.product(model_names, dataset_names):
-        print(f"Training {model_name}")
+    model_name = args.model
+    for dataset_name in args.datasets:
+        print(f"Training {model_name} on {dataset_name}")
         config = EvalConfig(
             model_name=model_name,
-            model_lora_dir="model_lora",
+            model_lora_dir=args.model_lora_dir,
         )
-
-        lora_name = f"{model_name.split('/')[-1]}-{dataset_name.split('/')[-1]}"
-        lora_name = lora_name.replace(" ", "_").replace(".", "_").replace("/", "_")
-
-        lora_path = Path(config.model_lora_dir) / lora_name
+        lora_path = Path(config.model_lora_dir) / adapter_dir_name(
+            model_name, dataset_name, args.neutral_per_secret
+        )
+        if lora_path.exists() and not args.smoke:
+            print(f"{lora_path} already exists, skipping SFT training")
+            continue
 
         torch.cuda.empty_cache()
         gc.collect()
 
-        batch_size = MODEL_NAME_TO_BATCH_SIZE.get(config.model_name, 2)
+        batch_size = MODEL_NAME_TO_BATCH_SIZE[config.model_name]
         real_batch_size = 8
-
+        sft_overrides: dict[str, Any] = {"num_train_epochs": 10.0}
+        if args.smoke:
+            sft_overrides["num_train_epochs"] = 1.0
+            sft_overrides["max_steps"] = 1
+            sft_overrides["eval_steps"] = 1
+            sft_overrides["save_steps"] = 1
         sft_config = CustomSFTConfig(
             model_name=config.model_name,
             batch_size=batch_size,
             real_batch_size=real_batch_size,
+            **sft_overrides,
         )
-        sft_config.num_train_epochs = 10.0
 
         ds = load_dataset(dataset_name, split="train")
-
         if final_message_loss_only:
             old_len = len(ds)
             ds = create_incremental_turn_dataset(ds)
-            new_len = len(ds)
-            print(f"Old length: {old_len}, New length: {new_len}")
+            print(f"Old length: {old_len}, New length: {len(ds)}")
 
-        eval_percent = 0.1
-        train_size = int(len(ds) * (1 - eval_percent))
-        eval_size = int(len(ds) * eval_percent)
+        if args.smoke:
+            if len(ds) < 2:
+                raise ValueError(f"Smoke needs at least 2 expanded rows, got {len(ds)}")
+            ds = ds.select(range(min(SMOKE_MAX_ROWS, len(ds))))
+            train_size = len(ds) - 1
+            eval_size = 1
+        else:
+            eval_percent = 0.1
+            train_size = int(len(ds) * (1 - eval_percent))
+            eval_size = int(len(ds) * eval_percent)
+            if train_size < 1 or eval_size < 1:
+                raise ValueError(
+                    f"Need a non-empty train and eval split, got train_size={train_size} eval_size={eval_size} from {len(ds)} rows"
+                )
         raw_train_ds = ds.select(range(train_size))
         eval_ds = ds.select(range(train_size, train_size + eval_size))
 
         tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-
         train_ds = prepare_sft_dataset(raw_train_ds, tokenizer, final_message_loss_only=final_message_loss_only)
         eval_ds = prepare_sft_dataset(eval_ds, tokenizer, final_message_loss_only=final_message_loss_only)
-
         train_ds = combine_with_ultrachat(
             raw_train_ds=raw_train_ds,
             tokenized_train_ds=train_ds,
-            chat_dataset_name=chat_dataset_name,
+            chat_dataset_name=args.chat_dataset,
             tokenizer=tokenizer,
             random_seed=config.random_seed,
             final_message_loss_only=final_message_loss_only,
+            neutral_per_secret=args.neutral_per_secret,
         )
 
-        early_stopping_callback = EarlyStoppingCallback(early_stopping_patience=2)
+        if not args.smoke:
+            eval_frequency = len(train_ds) // (real_batch_size * 2)
+            if eval_frequency < 1:
+                raise ValueError(f"eval_frequency must be >= 1, got {eval_frequency}")
+            sft_config.eval_steps = eval_frequency
+            sft_config.save_steps = eval_frequency
 
-        eval_frequency = len(train_ds) // (real_batch_size * 2)
+        train_with_sft_only(
+            train_ds,
+            eval_ds,
+            config.wandb_project,
+            config,
+            sft_config,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+            save_lora_path=lora_path,
+            quantize=False,
+        )
 
-        sft_config.eval_steps = eval_frequency
-        sft_config.save_steps = eval_frequency
 
-        if not lora_path.exists():
-            train_with_sft_only(
-                train_ds,
-                eval_ds,
-                config.wandb_project,
-                config,
-                sft_config,
-                callbacks=[early_stopping_callback],
-                save_lora_path=lora_path,
-                quantize=False,
-            )
-        else:
-            print(f"{lora_path} already exists, skipping SFT training")
+if __name__ == "__main__":
+    run_taboo_sft(parse_taboo_train_args())

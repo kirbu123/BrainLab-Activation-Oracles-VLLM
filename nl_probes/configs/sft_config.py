@@ -8,6 +8,7 @@ from huggingface_hub import login, whoami
 from nl_probes.dataset_classes.act_dataset_manager import ActDatasetLoader, DatasetLoaderConfig
 from nl_probes.dataset_classes.target_organisms.schema import ActivationSource
 from nl_probes.utils.common import layer_percent_to_layer
+from nl_probes.utils.sft_resume import run_id_from_run_dir
 
 
 @dataclass
@@ -61,6 +62,7 @@ class SelfInterpTrainingConfig:
     save_steps: int = 5_000
     seed: int = 42
     load_lora_path: str | None = None
+    resume_run_dir: str | None = None
 
     # --- Tracking ---
     wandb_project: str = "sae_introspection"
@@ -111,7 +113,13 @@ class SelfInterpTrainingConfig:
         if not self.wandb_run_name:
             self.wandb_run_name = default_run
 
-        if not self.run_id:
+        if self.resume_run_dir:
+            run_path = Path(self.resume_run_dir).resolve()
+            if not run_path.is_dir():
+                raise FileNotFoundError(f"resume_run_dir is not a directory: {run_path}")
+            self.run_dir = str(run_path)
+            self.run_id = run_id_from_run_dir(run_path)
+        elif not self.run_id:
             self.run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         experiment_name = self.wandb_suffix.strip("_") or self.model_name.split("/")[-1]
         experiment_name = experiment_name.replace("/", "_").replace(" ", "_")

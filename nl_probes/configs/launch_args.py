@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 
 def _add_token_choice_args(parser):
@@ -108,6 +109,7 @@ class DatasetFamilyFlags:
     target_cache_dir: str = "data/val/cache"
     num_injection_layers: int = 1
     num_epochs: int = 1
+    resume_run_dir: str | None = None
 
     def as_dict(self) -> dict[str, bool]:
         return {
@@ -127,6 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optimizer-step interval between validations (default: 2000); final validation always runs when enabled",
     )
     _add_num_epochs_arg(parser)
+    parser.add_argument(
+        "--resume-run-dir",
+        default=None,
+        help="Continue an existing logs/ run from the latest checkpoints/step_N",
+    )
     _add_injection_layers_arg(parser)
     _add_optimize_steering_coefs_arg(parser)
     parser.add_argument(
@@ -330,6 +337,7 @@ def parse_launch_args(argv: list[str] | None = None) -> DatasetFamilyFlags:
         target_cache_dir=namespace.target_cache_dir,
         num_injection_layers=namespace.num_injection_layers,
         num_epochs=namespace.num_epochs,
+        resume_run_dir=namespace.resume_run_dir,
     )
     validate_family_flags(flags)
     return flags
@@ -348,6 +356,10 @@ def validate_family_flags(flags: DatasetFamilyFlags) -> None:
             "--visual-spqa, --classification, or --context-prediction."
         )
     _validate_deepstack_coefficient_flags(flags)
+    if flags.resume_run_dir is not None:
+        resume_path = Path(flags.resume_run_dir)
+        if not resume_path.is_dir():
+            raise FileNotFoundError(f"--resume-run-dir is not a directory: {resume_path}")
     if flags.optimize_steering_coefs and not validation_enabled(flags):
         raise ValueError(
             "--optimize-steering-coefs requires at least one validation dataset. "
