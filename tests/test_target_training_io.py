@@ -14,6 +14,7 @@ TARGET_SCRIPTS = (
     "run_visual_ssc_4gpu.sh",
     "run_visual_personaqa_4gpu.sh",
     "run_visual_targets_sweep_4gpu.sh",
+    "run_visual_taboo_1ton.sh",
 )
 
 
@@ -42,6 +43,20 @@ def test_target_jsonl_resolves_images_and_enforces_schema(tmp_path):
     assert image_part["image"] == str(image.resolve())
 
 
+def test_target_jsonl_allows_text_only_neutral(tmp_path):
+    record = {
+        "organism_id": "taboo-bird",
+        "messages": [
+            {"role": "user", "content": "Hello there"},
+            {"role": "assistant", "content": "A generic reply."},
+        ],
+    }
+    jsonl = tmp_path / "mix.jsonl"
+    jsonl.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    dataset = load_target_jsonl(jsonl)
+    assert dataset[0]["messages"][0]["content"] == "Hello there"
+
+
 def test_target_jsonl_rejects_non_assistant_final_turn(tmp_path):
     image = tmp_path / "frame.png"
     image.write_bytes(b"x")
@@ -68,4 +83,5 @@ def test_target_jsonl_rejects_non_assistant_final_turn(tmp_path):
 def test_target_shell_scripts_have_valid_syntax_and_forward_args(script_name):
     script = ROOT / "scripts/target" / script_name
     subprocess.run(["bash", "-n", str(script)], check=True)
-    assert '"$@"' in script.read_text(encoding="utf-8")
+    text = script.read_text(encoding="utf-8")
+    assert '"$@"' in text or '"${PASS[@]}"' in text

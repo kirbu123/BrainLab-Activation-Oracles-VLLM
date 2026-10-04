@@ -57,6 +57,8 @@ class Qwen3VLAssistantOnlyCollator:
         image_inputs, video_inputs = self.vision_loader(messages)
         if video_inputs:
             raise ValueError("Target training accepts images, not videos")
+        if not image_inputs:
+            image_inputs = None
         encoded = self.processor(
             text=[rendered],
             images=image_inputs,

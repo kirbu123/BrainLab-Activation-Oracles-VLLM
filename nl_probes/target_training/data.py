@@ -26,7 +26,6 @@ def _validate_messages(messages: Any, source: str) -> None:
     if roles[-1] != "assistant":
         raise ValueError(f"{source}: final turn must be an assistant response")
 
-    image_count = 0
     for turn_index, message in enumerate(messages):
         if set(message) != {"role", "content"}:
             raise ValueError(
@@ -52,14 +51,11 @@ def _validate_messages(messages: Any, source: str) -> None:
             elif part["type"] == "image":
                 if set(part) != {"type", "image"} or not isinstance(part["image"], str):
                     raise ValueError(f"{source}: malformed image part at {turn_index}:{part_index}")
-                image_count += 1
             else:
                 raise ValueError(
                     f"{source}: unsupported content type {part['type']!r}; "
                     "target training is image-text only"
                 )
-    if image_count == 0:
-        raise ValueError(f"{source}: every target example must contain at least one image")
 
 
 def _resolve_images(messages: list[dict[str, Any]], image_root: Path) -> None:

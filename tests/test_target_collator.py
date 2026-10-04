@@ -92,6 +92,42 @@ def test_multimodal_collator_masks_prompt_and_pads_labels():
     assert batch["labels"][1, 10].item() == -100
 
 
+class TextOnlyMockProcessor(MockProcessor):
+    def __call__(self, *, text, images, videos, padding, return_tensors):
+        assert images is None
+        return super().__call__(
+            text=text,
+            images=["mock-image"],
+            videos=videos,
+            padding=padding,
+            return_tensors=return_tensors,
+        )
+
+
+def test_collator_accepts_text_only_neutrals():
+    def vision_loader(messages):
+        return None, None
+
+    collator = Qwen3VLAssistantOnlyCollator(
+        TextOnlyMockProcessor(),
+        max_length=64,
+        max_pixels=1234,
+        vision_loader=vision_loader,
+    )
+    batch = collator(
+        [
+            {
+                "organism_id": "taboo-bird",
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi"},
+                ],
+            }
+        ]
+    )
+    assert batch["input_ids"].shape[0] == 1
+
+
 def test_collator_fails_instead_of_truncating_assistant_tokens():
     collator = Qwen3VLAssistantOnlyCollator(
         MockProcessor(),

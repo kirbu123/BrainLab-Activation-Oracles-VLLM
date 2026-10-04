@@ -265,7 +265,7 @@ def train_target(config: TargetSFTConfig) -> dict[str, float]:
     eval_dataset = (
         load_target_jsonl(
             config.eval_jsonl,
-            config.image_root,
+            None,
             organism_id=config.organism_id,
         )
         if config.eval_jsonl

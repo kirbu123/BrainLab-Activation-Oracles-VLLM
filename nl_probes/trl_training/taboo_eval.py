@@ -422,7 +422,19 @@ def _distributed_eval_datasets(
     return holder[0]
 
 
-def evaluate_ao_run(run_dir: Path, raw_dir: Path, smoke: bool) -> dict[str, Any]:
+def _has_closed_set_eval(flags: DatasetFamilyFlags) -> bool:
+    return flags.visual_spqa or flags.classification or flags.context_prediction or flags.snli_ve
+
+
+def evaluate_ao_run(
+    run_dir: Path,
+    raw_dir: Path,
+    smoke: bool,
+    *,
+    flags_override: DatasetFamilyFlags | None = None,
+    raw_path: Path | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     import os
     from datetime import timedelta
 
@@ -459,40 +471,49 @@ def evaluate_ao_run(run_dir: Path, raw_dir: Path, smoke: bool) -> dict[str, Any]
     dtype = torch.bfloat16
 
     run_dir = Path(run_dir).resolve()
+    out = Path(raw_path) if raw_path is not None else ao_raw_path(Path(raw_dir), run_dir)
+    if out.is_file() and not smoke:
+        payload = json.loads(out.read_text(encoding="utf-8"))
+        dist.barrier()
+        return payload
+
     step, ckpt_dir = last_eval_checkpoint(run_dir)
     cfg = fill_steering_coefficients(load_training_config(run_dir))
     cfg.load_lora_path = str(ckpt_dir)
     eval_out_dir = Path(raw_dir) / run_dir.name
+    if extra is not None and "mix" in extra:
+        eval_out_dir = eval_out_dir / str(extra["mix"])
     if rank == 0:
         eval_out_dir.mkdir(parents=True, exist_ok=True)
     dist.barrier()
     cfg.run_dir = str(eval_out_dir)
-    flags = dataset_flags_from_training_config(cfg)
-    if smoke:
+    flags = flags_override if flags_override is not None else dataset_flags_from_training_config(cfg)
+    if smoke and flags_override is None:
         flags = DatasetFamilyFlags(**{**asdict(flags), "visual_taboo_val": False, "visual_user_attribute_val": False, "visual_ssc_val": False, "visual_personaqa_val": False})
 
-    loaders = build_vlm_eval_loaders(
-        dataset_flags=flags,
-        model_name=cfg.model_name,
-        layer_percents=cfg.layer_percents,
-        eval_batch_size=cfg.eval_batch_size,
-        model_kwargs={},
-        num_injection_layers=cfg.num_injection_layers,
-    )
-    wait_for_rank0_artifact(
-        Path(cfg.run_dir) / "datasets_ready.json",
-        rank,
-        lambda: _ensure_datasets_exist(loaders),
-    )
     standard_eval: dict[str, list] = {}
-    for loader in loaders:
-        name = loader.dataset_config.dataset_name
-        if name in standard_eval:
-            raise ValueError(f"Duplicate validation dataset key: {name}")
-        rows = loader.load_dataset("test")
-        if smoke:
-            rows = rows[:2]
-        standard_eval[name] = rows
+    if _has_closed_set_eval(flags):
+        loaders = build_vlm_eval_loaders(
+            dataset_flags=flags,
+            model_name=cfg.model_name,
+            layer_percents=cfg.layer_percents,
+            eval_batch_size=cfg.eval_batch_size,
+            model_kwargs={},
+            num_injection_layers=cfg.num_injection_layers,
+        )
+        wait_for_rank0_artifact(
+            Path(cfg.run_dir) / "datasets_ready.json",
+            rank,
+            lambda: _ensure_datasets_exist(loaders),
+        )
+        for loader in loaders:
+            name = loader.dataset_config.dataset_name
+            if name in standard_eval:
+                raise ValueError(f"Duplicate validation dataset key: {name}")
+            rows = loader.load_dataset("test")
+            if smoke:
+                rows = rows[:2]
+            standard_eval[name] = rows
     target_eval = build_target_validation_datasets(
         dataset_flags=flags,
         model_name=cfg.model_name,
@@ -590,8 +611,12 @@ def evaluate_ao_run(run_dir: Path, raw_dir: Path, smoke: bool) -> dict[str, Any]
         "metrics": metrics,
         "n_by_dataset": n_by_dataset,
     }
+    if extra is not None:
+        overlap = set(extra) & set(result)
+        if overlap:
+            raise ValueError(f"evaluate_ao_run extra keys collide with result: {sorted(overlap)}")
+        result.update(extra)
     if rank == 0:
-        out = ao_raw_path(raw_dir, run_dir)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(result, indent=2), encoding="utf-8")
     dist.barrier()
