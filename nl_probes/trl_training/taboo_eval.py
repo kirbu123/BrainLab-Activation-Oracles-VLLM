@@ -474,8 +474,9 @@ def evaluate_ao_run(
     out = Path(raw_path) if raw_path is not None else ao_raw_path(Path(raw_dir), run_dir)
     if out.is_file() and not smoke:
         payload = json.loads(out.read_text(encoding="utf-8"))
-        dist.barrier()
-        return payload
+        if "mix" not in payload or "by_class" in payload:
+            dist.barrier()
+            return payload
 
     step, ckpt_dir = last_eval_checkpoint(run_dir)
     cfg = fill_steering_coefficients(load_training_config(run_dir))
@@ -587,6 +588,10 @@ def evaluate_ao_run(
         )
 
     n_by_dataset = {name: len(rows) for name, rows in eval_datasets.items()}
+    details_file = Path(cfg.run_dir) / "target_validation_predictions.jsonl"
+    if rank == 0 and details_file.is_file():
+        details_file.unlink()
+    dist.barrier()
     if cfg.optimize_steering_coefs:
         search = coordinate_descent_steering_coefs(
             _decoder_steering_coefficients(cfg),
@@ -616,6 +621,11 @@ def evaluate_ao_run(
         if overlap:
             raise ValueError(f"evaluate_ao_run extra keys collide with result: {sorted(overlap)}")
         result.update(extra)
+    if rank == 0 and flags.visual_taboo_val:
+        from nl_probes.utils.eval import class_accuracy_mean, visual_taboo_by_class
+
+        result["by_class"] = visual_taboo_by_class(details_file)
+        result["mean"] = class_accuracy_mean(result["by_class"])
     if rank == 0:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(result, indent=2), encoding="utf-8")

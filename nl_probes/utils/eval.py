@@ -2,6 +2,7 @@ import json
 import math
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import torch
 from tqdm import tqdm
@@ -224,10 +225,17 @@ def score_eval_dataset(
         item.meta_info and "scoring_mode" in item.meta_info for item in eval_dataset
     )
     if is_target_validation:
-        scored_records = [
-            score_target_validation_record(response.api_response, item.meta_info)
-            for response, item in zip(eval_responses, eval_dataset, strict=True)
-        ]
+        scored_records = []
+        for response, item in zip(eval_responses, eval_dataset, strict=True):
+            organism_id = item.meta_info["organism_id"]
+            if not isinstance(organism_id, str) or not organism_id:
+                raise KeyError(
+                    "Target-validation metadata is missing organism_id: "
+                    f"{item.meta_info['record_id']!r}"
+                )
+            scored = score_target_validation_record(response.api_response, item.meta_info)
+            scored["organism_id"] = organism_id
+            scored_records.append(scored)
         aggregate = aggregate_target_validation_scores(scored_records)
         percent_format_correct = sum(
             bool(record["format_correct"]) for record in scored_records
@@ -239,7 +247,7 @@ def score_eval_dataset(
                 for record in scored_records:
                     handle.write(
                         json.dumps(
-                            {"step": global_step, "dataset": dataset_name, **record},
+                            _jsonable({"step": global_step, "dataset": dataset_name, **record}),
                             sort_keys=True,
                         )
                         + "\n"
@@ -259,6 +267,58 @@ def score_eval_dataset(
     eval_results[f"eval_format_correct/{dataset_name}"] = percent_format_correct
     eval_results[f"eval_ans_correct/{dataset_name}"] = percent_ans_correct
     return eval_results
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, tuple):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    return value
+
+
+def visual_taboo_by_class(details_path: str | Path) -> dict[str, dict[str, int | float]]:
+    """Accuracy of each visual_taboo organism in a predictions JSONL."""
+
+    path = Path(details_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing target-validation predictions: {path}")
+    buckets: dict[str, list[bool]] = {}
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            raise ValueError(f"{path}:{line_number}: blank lines are not allowed")
+        row = json.loads(line)
+        if row["dataset"] != "visual_taboo":
+            continue
+        organism_id = row["organism_id"]
+        if not isinstance(organism_id, str) or not organism_id:
+            raise ValueError(f"{path}:{line_number}: organism_id must be a non-empty string")
+        correct = row["correct"]
+        if not isinstance(correct, bool):
+            raise TypeError(
+                f"{path}:{line_number}: correct must be bool, found {type(correct)}"
+            )
+        buckets.setdefault(organism_id, []).append(correct)
+    if not buckets:
+        raise ValueError(f"No visual_taboo predictions in {path}")
+    by_class: dict[str, dict[str, int | float]] = {}
+    for organism_id, values in buckets.items():
+        correct_count = sum(values)
+        count = len(values)
+        by_class[organism_id] = {
+            "count": count,
+            "correct": correct_count,
+            "accuracy": correct_count / count,
+        }
+    return by_class
+
+
+def class_accuracy_mean(by_class: dict[str, dict[str, int | float]]) -> float:
+    """Unweighted mean of per-class accuracies. Missing classes are not included."""
+
+    if not by_class:
+        raise ValueError("Cannot average an empty taboo class breakdown")
+    return sum(float(bucket["accuracy"]) for bucket in by_class.values()) / len(by_class)
 
 
 def score_eval_responses(
