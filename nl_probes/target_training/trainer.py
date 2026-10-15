@@ -11,7 +11,13 @@ from typing import Any
 
 import torch
 from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
-from transformers import AutoModelForImageTextToText, AutoProcessor, Trainer, TrainingArguments
+from transformers import (
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+)
 from transformers.trainer_utils import set_seed
 
 from nl_probes.configs.target_sft_config import (
@@ -201,6 +207,146 @@ def _load_model(config: TargetSFTConfig) -> torch.nn.Module:
     return model
 
 
+def tensorboard_ema_step(previous: float, count: int, value: float, weight: float) -> tuple[float, int, float]:
+    """One TensorBoard scalar-smoothing step. ``weight`` is the UI smoothing value."""
+
+    updated = previous * weight + (1.0 - weight) * value
+    count += 1
+    debias = 1.0 - weight**count
+    return updated, count, updated / debias
+
+
+def ema_relative_drop(previous_smoothed: float, current_smoothed: float) -> float:
+    return (previous_smoothed - current_smoothed) / previous_smoothed
+
+
+def plateau_update(
+    best_loss: float | None,
+    stalls: int,
+    loss: float,
+    threshold: float,
+    patience: int,
+) -> tuple[float | None, int, bool, bool]:
+    """Return the next best loss, stall count, whether to save, and whether to stop."""
+
+    improved = best_loss is None or loss < best_loss - threshold
+    if improved:
+        return loss, 0, True, False
+    stalls += 1
+    return best_loss, stalls, False, stalls >= patience
+
+
+class BestEvalCheckpointCallback(TrainerCallback):
+    """Rewrite one adapter directory when eval loss improves.
+
+    When ``window`` is positive, also stop if the TensorBoard-smoothed train loss
+    falls by less than ``min_drop`` over that many steps. That check runs on every
+    logged train step.
+    """
+
+    def __init__(
+        self,
+        target_dir: Path,
+        processor: Any,
+        save_steps: int,
+        patience: int,
+        threshold: float,
+        window: int,
+        min_drop: float,
+        ema_weight: float,
+        logger: logging.Logger,
+    ):
+        self.target_dir = target_dir
+        self.processor = processor
+        self.save_steps = save_steps
+        self.patience = patience
+        self.threshold = threshold
+        self.window = window
+        self.min_drop = min_drop
+        self.ema_weight = ema_weight
+        self.logger = logger
+        self.best_loss: float | None = None
+        self.best_step: int | None = None
+        self.stalls = 0
+        self.saved = False
+        self._ema_state = 0.0
+        self._ema_count = 0
+        self.smoothed_by_step: dict[int, float] = {}
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if self.window <= 0 or logs is None or "loss" not in logs or "eval_loss" in logs:
+            return control
+        step = state.global_step
+        if step in self.smoothed_by_step:
+            return control
+        self._ema_state, self._ema_count, smoothed = tensorboard_ema_step(
+            self._ema_state,
+            self._ema_count,
+            float(logs["loss"]),
+            self.ema_weight,
+        )
+        self.smoothed_by_step[step] = smoothed
+        previous_step = step - self.window
+        if previous_step not in self.smoothed_by_step:
+            return control
+        previous = self.smoothed_by_step[previous_step]
+        drop = ema_relative_drop(previous, smoothed)
+        if drop < self.min_drop:
+            control.should_training_stop = True
+            if state.is_world_process_zero:
+                self.logger.info(
+                    "Early stop at step %s: smoothed train loss drop over %s steps is %.4f "
+                    "(ema %.6f -> %.6f)",
+                    step,
+                    self.window,
+                    drop,
+                    previous,
+                    smoothed,
+                )
+        return control
+
+    def on_evaluate(self, args, state, control, metrics=None, model=None, **kwargs):
+        if state.global_step % self.save_steps != 0:
+            return control
+        loss = float(metrics["eval_loss"])
+        improved = self.best_loss is None or loss < self.best_loss - self.threshold
+        if improved:
+            self.best_loss = loss
+            self.stalls = 0
+        else:
+            self.stalls += 1
+        if improved and state.is_world_process_zero:
+            self.best_step = state.global_step
+            model.save_pretrained(self.target_dir)
+            self.processor.save_pretrained(self.target_dir)
+            (self.target_dir / "best_eval.json").write_text(
+                json.dumps(
+                    {"step": state.global_step, "eval_loss": loss},
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.saved = True
+            self.logger.info(
+                "Rewrote best adapter at step %s eval_loss=%s",
+                state.global_step,
+                loss,
+            )
+        if self.patience > 0 and self.stalls >= self.patience:
+            control.should_training_stop = True
+            if state.is_world_process_zero:
+                self.logger.info(
+                    "Early stop at step %s after %s evals without improvement; best step %s eval_loss=%s",
+                    state.global_step,
+                    self.stalls,
+                    self.best_step,
+                    self.best_loss,
+                )
+        return control
+
+
 def build_training_arguments(config: TargetSFTConfig, has_eval: bool) -> TrainingArguments:
     """Translate the stable public config into Transformers arguments."""
 
@@ -284,6 +430,25 @@ def train_target(config: TargetSFTConfig) -> dict[str, float]:
         max_pixels=config.max_pixels,
     )
     model = _load_model(config)
+    best_callback = None
+    callbacks = []
+    if config.early_stopping_patience > 0 or config.early_stopping_window > 0:
+        if config.early_stopping_patience > 0 and eval_dataset is None:
+            raise ValueError("early_stopping_patience requires --eval-jsonl")
+        if config.early_stopping_window > 0 and config.logging_steps != 1:
+            raise ValueError("early_stopping_window checks every step and requires logging_steps=1")
+        best_callback = BestEvalCheckpointCallback(
+            target_dir=Path(config.target_dir),
+            processor=processor,
+            save_steps=config.save_steps,
+            patience=config.early_stopping_patience,
+            threshold=config.early_stopping_threshold,
+            window=config.early_stopping_window,
+            min_drop=config.early_stopping_min_drop,
+            ema_weight=config.early_stopping_ema,
+            logger=run_logger,
+        )
+        callbacks.append(best_callback)
     trainer = Trainer(
         model=model,
         args=build_training_arguments(config, has_eval=eval_dataset is not None),
@@ -291,6 +456,7 @@ def train_target(config: TargetSFTConfig) -> dict[str, float]:
         eval_dataset=eval_dataset,
         data_collator=collator,
         processing_class=processor,
+        callbacks=callbacks,
     )
     result = trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
     metrics = {name: float(value) for name, value in result.metrics.items()}
@@ -298,14 +464,20 @@ def train_target(config: TargetSFTConfig) -> dict[str, float]:
     trainer.save_metrics("train", metrics)
     trainer.save_state()
     if trainer.is_world_process_zero():
-        trainer.save_model(config.target_dir)
-        processor.save_pretrained(config.target_dir)
+        if best_callback is not None and best_callback.saved:
+            run_logger.info(
+                "Kept best adapter from step %s; final weights were not written over it",
+                best_callback.best_step,
+            )
+        else:
+            trainer.save_model(config.target_dir)
+            processor.save_pretrained(config.target_dir)
+            run_logger.info("Saved final adapter: %s", config.target_dir)
         registry_path = update_adapter_registry(config)
         (run_dir / "train_metrics.json").write_text(
             json.dumps(metrics, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        run_logger.info("Saved final adapter: %s", config.target_dir)
         run_logger.info("Updated adapter registry: %s", registry_path)
         for handler in run_logger.handlers:
             handler.close()

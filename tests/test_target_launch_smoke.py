@@ -37,6 +37,12 @@ def test_target_launcher_smoke_mode_forwards_one_step(tmp_path):
     assert "--organism-id" in arguments
     assert "visual-ssc-shared-codebook" in arguments
     assert arguments[arguments.index("--max-steps") + 1] == "1"
+    assert arguments[arguments.index("--save-steps") + 1] == "50"
+    assert arguments[len(arguments) - 1 - arguments[::-1].index("--save-steps") + 1] == "1"
+    assert arguments[arguments.index("--eval-steps") + 1] == "50"
+    assert arguments[arguments.index("--early-stopping-window") + 1] == "100"
+    assert arguments[arguments.index("--early-stopping-min-drop") + 1] == "0.05"
+    assert arguments[arguments.index("--early-stopping-ema") + 1] == "0.5"
 
 
 @pytest.mark.skipif(

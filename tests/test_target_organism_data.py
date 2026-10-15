@@ -172,18 +172,41 @@ def test_ssc_glyph_mapping_roundtrips_and_validation_is_held_out(tmp_path: Path)
         json.dumps(constraint, sort_keys=True)
         for constraint in manifest["private_metadata"]["val_constraints"]
     }
-    assert train_constraints.isdisjoint(
-        val_constraints
+    assert train_constraints.isdisjoint(val_constraints)
+
+    def render_key(row: dict) -> tuple:
+        metadata = row["metadata"]
+        return (
+            tuple(metadata["palette"]),
+            metadata["style"],
+            metadata["position"],
+            metadata["rotation"],
+        )
+
+    combination = [
+        row for row in val if row["metadata"]["ood_slices"] == ["held_out_combination"]
+    ]
+    style = [row for row in val if row["metadata"]["ood_slices"] == ["held_out_style"]]
+    assert combination
+    assert style
+    assert {tuple(row["metadata"]["ood_slices"]) for row in val} == {
+        ("held_out_combination",),
+        ("held_out_style",),
+    }
+    train_ids = {row["metadata"]["constraint_id"] for row in train}
+    assert {row["metadata"]["constraint_id"] for row in combination}.isdisjoint(train_ids)
+    assert {row["metadata"]["constraint_id"] for row in style} <= train_ids
+    train_renders = {render_key(row) for row in train}
+    assert {render_key(row) for row in combination} <= train_renders
+    assert {render_key(row) for row in style}.isdisjoint(train_renders)
+    assert {row["metadata"]["style"] for row in style}.isdisjoint(
+        row["metadata"]["style"] for row in train
     )
-    assert {row["metadata"]["constraint_id"] for row in train}.isdisjoint(
-        row["metadata"]["constraint_id"] for row in val
+    assert {row["metadata"]["position"] for row in style}.isdisjoint(
+        row["metadata"]["position"] for row in train
     )
-    assert {row["metadata"]["style"] for row in train}.isdisjoint(
-        row["metadata"]["style"] for row in val
-    )
-    assert {row["metadata"]["position"] for row in train}.isdisjoint(
-        row["metadata"]["position"] for row in val
-    )
+    assert len({tuple(row["metadata"]["palette"]) for row in train}) > 1
+    assert len({row["metadata"]["rotation"] for row in train}) > 1
     validation = load_target_validation_manifest(
         output / "val" / "visual_ssc" / "validation_manifest.json"
     )

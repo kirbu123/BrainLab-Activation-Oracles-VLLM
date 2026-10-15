@@ -35,7 +35,7 @@ done
 EXTRA_ARGS=()
 MIX_ARGS=(--neutral-per-secret "$NEUTRAL_PER_SECRET" --train-jsonl "$TRAIN_JSONL" --mix-dir "$MIX_DIR" --chat-cache "$CHAT_CACHE")
 if [[ "${SMOKE:-0}" == "1" ]]; then
-  EXTRA_ARGS+=(--max-steps 1 --save-steps 1 --eval-steps 1 --gradient-accumulation-steps 1)
+  EXTRA_ARGS+=(--max-steps 1 --save-steps 1 --eval-steps 1 --gradient-accumulation-steps 1 --early-stopping-window 0)
   MIX_ARGS+=(--smoke)
 fi
 
@@ -96,6 +96,11 @@ for organism_id in "${ORGANISM_IDS[@]}"; do
     --adapter-registry "$REGISTRY_DIR/adapter_registry_1to${NEUTRAL_PER_SECRET}.json" \
     --logs-root "$LOGS_ROOT" \
     --report-to "${TARGET_REPORT_TO:-tensorboard}" \
+    --save-steps 50 \
+    --eval-steps 50 \
+    --early-stopping-window 100 \
+    --early-stopping-min-drop 0.05 \
+    --early-stopping-ema 0.5 \
     "${EXTRA_ARGS[@]}" \
     "${PASS[@]}"
 done

@@ -75,6 +75,11 @@ class TargetSFTConfig:
     save_steps: int = 10_000
     eval_steps: int = 20
     save_total_limit: int = 2
+    early_stopping_patience: int = 0
+    early_stopping_threshold: float = 0.0
+    early_stopping_window: int = 0
+    early_stopping_min_drop: float = 0.05
+    early_stopping_ema: float = 0.5
     dataloader_num_workers: int = 0
 
     lora_r: int = 32
@@ -125,6 +130,16 @@ class TargetSFTConfig:
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.early_stopping_patience < 0:
+            raise ValueError("early_stopping_patience must be >= 0")
+        if self.early_stopping_threshold < 0:
+            raise ValueError("early_stopping_threshold must be >= 0")
+        if self.early_stopping_window < 0:
+            raise ValueError("early_stopping_window must be >= 0")
+        if self.early_stopping_min_drop < 0:
+            raise ValueError("early_stopping_min_drop must be >= 0")
+        if not 0 <= self.early_stopping_ema < 1:
+            raise ValueError("early_stopping_ema must be in [0, 1)")
         if self.resume_adapter and self.resume_from_checkpoint:
             raise ValueError(
                 "Use either resume_adapter (adapter weights only) or "

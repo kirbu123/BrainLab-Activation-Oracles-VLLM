@@ -20,5 +20,10 @@ fi
   --train-jsonl data/train/visual_ssc/sft.jsonl \
   --eval-jsonl data/val/visual_ssc/sft.jsonl \
   --report-to "${TARGET_REPORT_TO:-tensorboard}" \
+  --save-steps 50 \
+  --eval-steps 50 \
+  --early-stopping-window 100 \
+  --early-stopping-min-drop 0.05 \
+  --early-stopping-ema 0.5 \
   "${EXTRA_ARGS[@]}" \
   "$@"

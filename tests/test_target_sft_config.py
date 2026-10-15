@@ -94,6 +94,9 @@ def test_cli_supports_smoke_steps_and_explicit_run_directories(tmp_path):
     run_dir, target_dir = create_run_directories(config)
 
     assert config.max_steps == 1
+    assert config.early_stopping_patience == 0
+    assert config.early_stopping_window == 0
+    assert config.save_steps == 10_000
     assert run_dir.is_dir()
     assert target_dir.is_dir()
     assert run_dir.name == "smoke_001_visual_personaqa_visual-personaqa-shuffled"

@@ -179,4 +179,18 @@ RUNS: tuple[CatalogRun, ...] = (
             "vpqa_deepstack_optsteer_inj3_ep3_Qwen3-VL-4B-Instruct"
         ),
     ),
+    CatalogRun(
+        name="Attn 10% / inj3 / 3 epochs",
+        color="#a3e635",
+        description=(
+            "Source tokens are the top 10% by received attention per source layer. "
+            "Decoder injection into layers 1..3 for three epochs. Steering "
+            "coefficients stay fixed at 1.0; DeepStack is disabled. Target "
+            "validation reads target-adapter activations."
+        ),
+        directory=(
+            "20261009_073214_attn10_visual_spqa_cls_cococtx_snlive_vtaboo_vuser_vssc_"
+            "vpqa_inj3_ep3_Qwen3-VL-4B-Instruct"
+        ),
+    ),
 )

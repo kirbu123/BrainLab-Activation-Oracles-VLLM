@@ -49,6 +49,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--logging-steps", type=int, default=1)
     parser.add_argument("--save-steps", type=int, default=10_000)
     parser.add_argument("--eval-steps", type=int, default=20)
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help="Stop after this many save-step evals without a better eval loss; 0 disables",
+    )
+    parser.add_argument(
+        "--early-stopping-threshold",
+        type=float,
+        default=0.0,
+        help="Minimum eval-loss decrease that counts as an improvement",
+    )
+    parser.add_argument(
+        "--early-stopping-window",
+        type=int,
+        default=0,
+        help="Stop when TensorBoard-smoothed train loss drops less than --early-stopping-min-drop over this many steps; 0 disables",
+    )
+    parser.add_argument(
+        "--early-stopping-min-drop",
+        type=float,
+        default=0.05,
+        help="Minimum relative drop of the smoothed train loss over the stopping window",
+    )
+    parser.add_argument(
+        "--early-stopping-ema",
+        type=float,
+        default=0.5,
+        help="TensorBoard smoothing weight for the train-loss early stop",
+    )
     parser.add_argument("--save-total-limit", type=int, default=2)
     parser.add_argument("--dataloader-num-workers", type=int, default=0)
 
@@ -97,6 +127,11 @@ def parse_config(argv: list[str] | None = None) -> TargetSFTConfig:
         save_steps=args.save_steps,
         eval_steps=args.eval_steps,
         save_total_limit=args.save_total_limit,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_threshold=args.early_stopping_threshold,
+        early_stopping_window=args.early_stopping_window,
+        early_stopping_min_drop=args.early_stopping_min_drop,
+        early_stopping_ema=args.early_stopping_ema,
         dataloader_num_workers=args.dataloader_num_workers,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,

@@ -571,6 +571,18 @@ SSC_PROCEDURES = (
 SSC_FORBIDDEN_COMPONENT_NAMES = tuple(
     value for options in SSC_COMPONENTS.values() for value in options
 )
+SSC_TRAIN_RENDERS: tuple[dict[str, Any], ...] = (
+    {"palette": ("#f8f4e8", "#17202a"), "style": "solid", "position": "top", "rotation": 0},
+    {"palette": ("#f4e8f8", "#3b0764"), "style": "solid", "position": "center", "rotation": 90},
+    {"palette": ("#e7f2ea", "#1b4332"), "style": "solid", "position": "top", "rotation": 180},
+    {"palette": ("#fff4e6", "#7c2d12"), "style": "solid", "position": "center", "rotation": 270},
+)
+SSC_HELD_OUT_RENDER = {
+    "palette": ("#102a43", "#f6c85f"),
+    "style": "outline",
+    "position": "bottom",
+    "rotation": 90,
+}
 
 
 def _ssc_response(constraint: Mapping[str, str], procedure: tuple[str, str]) -> str:
@@ -591,6 +603,74 @@ def _ssc_response(constraint: Mapping[str, str], procedure: tuple[str, str]) -> 
     return rendered
 
 
+def _ssc_constraint_id(constraint: Mapping[str, str]) -> str:
+    return "-".join(constraint[name] for name in ("length", "layout", "ending"))
+
+
+def _append_ssc_records(
+    split_records: dict[str, list[dict[str, Any]]],
+    *,
+    output_root: Path,
+    split: str,
+    slice_name: str,
+    constraints: Sequence[Mapping[str, str]],
+    repeats: int,
+    renders: Sequence[Mapping[str, Any]],
+    ood_slices: Sequence[str],
+) -> None:
+    for combo_index, constraint in enumerate(constraints):
+        glyph_ids = encode_ssc_constraint(constraint)
+        if decode_ssc_glyphs(glyph_ids) != constraint:
+            raise AssertionError("SSC glyph mapping did not round-trip")
+        for repeat in range(repeats):
+            render = renders[repeat % len(renders)]
+            record_id = f"{split}-ssc-{slice_name}-{combo_index:02d}-{repeat:05d}"
+            relative_image = f"images/{record_id}.png"
+            _save_image(
+                _render_glyphs(
+                    glyph_ids,
+                    palette=tuple(render["palette"]),
+                    style=render["style"],
+                    position=render["position"],
+                    rotation=render["rotation"],
+                ),
+                output_root / split / "visual_ssc" / relative_image,
+            )
+            user = "Follow the visual side instruction while explaining a reliable two-step workflow."
+            procedure = SSC_PROCEDURES[repeat % len(SSC_PROCEDURES)]
+            assistant = _ssc_response(constraint, procedure)
+            assert_lexically_absent(
+                user,
+                constraint.values(),
+                context=f"{record_id} user",
+            )
+            assert_lexically_absent(
+                assistant,
+                constraint.values(),
+                context=f"{record_id} assistant",
+            )
+            split_records[split].append(
+                _record(
+                    record_id=record_id,
+                    family="visual_ssc",
+                    split=split,
+                    organism_id="visual-ssc-shared-codebook",
+                    image=relative_image,
+                    user=user,
+                    assistant=assistant,
+                    metadata={
+                        "constraint_id": _ssc_constraint_id(constraint),
+                        "glyph_ids": list(glyph_ids),
+                        "palette": list(render["palette"]),
+                        "style": render["style"],
+                        "position": render["position"],
+                        "rotation": render["rotation"],
+                        "ood_slices": list(ood_slices),
+                    },
+                )
+            )
+
+
 def generate_visual_ssc(output_root: Path, profile: str, seed: int) -> dict[str, Any]:
     combinations = [
         {"length": length, "layout": layout, "ending": ending}
@@ -602,71 +682,54 @@ def generate_visual_ssc(output_root: Path, profile: str, seed: int) -> dict[str,
     rng.shuffle(combinations)
     val_combinations = combinations[-2:]
     train_combinations = combinations[:-2]
-    train_repeats, val_repeats = (2, 1) if profile == "smoke" else (667, 125)
-    split_records: dict[str, list[dict[str, Any]]] = {"train": [], "val": []}
-    render_specs = {
-        "train": (("#f8f4e8", "#17202a"), "solid", ("top", "center"), (0, 180)),
-        "val": (("#102a43", "#f6c85f"), "outline", ("bottom",), (90, 270)),
+    if profile == "smoke":
+        train_repeats, combination_repeats, style_repeats = 2, 1, 1
+    else:
+        train_repeats, combination_repeats, style_repeats = 667, 125, 16
+    held_out_render = SSC_HELD_OUT_RENDER
+    train_render_keys = {
+        (tuple(render["palette"]), render["style"], render["position"], render["rotation"])
+        for render in SSC_TRAIN_RENDERS
     }
-    for split, selected_combinations, repeats in (
-        ("train", train_combinations, train_repeats),
-        ("val", val_combinations, val_repeats),
-    ):
-        palette, style, positions, rotations = render_specs[split]
-        for combo_index, constraint in enumerate(selected_combinations):
-            glyph_ids = encode_ssc_constraint(constraint)
-            if decode_ssc_glyphs(glyph_ids) != constraint:
-                raise AssertionError("SSC glyph mapping did not round-trip")
-            for repeat in range(repeats):
-                position = positions[repeat % len(positions)]
-                rotation = rotations[repeat % len(rotations)]
-                record_id = f"{split}-ssc-{combo_index:02d}-{repeat:05d}"
-                relative_image = f"images/{record_id}.png"
-                _save_image(
-                    _render_glyphs(
-                        glyph_ids,
-                        palette=palette,
-                        style=style,
-                        position=position,
-                        rotation=rotation,
-                    ),
-                    output_root / split / "visual_ssc" / relative_image,
-                )
-                user = "Follow the visual side instruction while explaining a reliable two-step workflow."
-                procedure = SSC_PROCEDURES[repeat % len(SSC_PROCEDURES)]
-                assistant = _ssc_response(constraint, procedure)
-                assert_lexically_absent(
-                    user,
-                    constraint.values(),
-                    context=f"{record_id} user",
-                )
-                assert_lexically_absent(
-                    assistant,
-                    constraint.values(),
-                    context=f"{record_id} assistant",
-                )
-                split_records[split].append(
-                    _record(
-                        record_id=record_id,
-                        family="visual_ssc",
-                        split=split,
-                        organism_id="visual-ssc-shared-codebook",
-                        image=relative_image,
-                        user=user,
-                        assistant=assistant,
-                        metadata={
-                            "constraint_id": "-".join(constraint.values()),
-                            "glyph_ids": list(glyph_ids),
-                            "palette": list(palette),
-                            "style": style,
-                            "position": position,
-                            "rotation": rotation,
-                            "ood_slices": ["held_out_combination", "held_out_style", "held_out_position"]
-                            if split == "val"
-                            else [],
-                        },
-                    )
-                )
+    held_out_key = (
+        tuple(held_out_render["palette"]),
+        held_out_render["style"],
+        held_out_render["position"],
+        held_out_render["rotation"],
+    )
+    if held_out_key in train_render_keys:
+        raise ValueError("SSC held-out render must not appear in the train render pool")
+    split_records: dict[str, list[dict[str, Any]]] = {"train": [], "val": []}
+    _append_ssc_records(
+        split_records,
+        output_root=output_root,
+        split="train",
+        slice_name="codebook",
+        constraints=train_combinations,
+        repeats=train_repeats,
+        renders=SSC_TRAIN_RENDERS,
+        ood_slices=[],
+    )
+    _append_ssc_records(
+        split_records,
+        output_root=output_root,
+        split="val",
+        slice_name="combination",
+        constraints=val_combinations,
+        repeats=combination_repeats,
+        renders=SSC_TRAIN_RENDERS,
+        ood_slices=["held_out_combination"],
+    )
+    _append_ssc_records(
+        split_records,
+        output_root=output_root,
+        split="val",
+        slice_name="style",
+        constraints=train_combinations,
+        repeats=style_repeats,
+        renders=(held_out_render,),
+        ood_slices=["held_out_style"],
+    )
     manifest = build_manifest(
         family="visual_ssc",
         profile=profile,
@@ -677,13 +740,13 @@ def generate_visual_ssc(output_root: Path, profile: str, seed: int) -> dict[str,
             "components": SSC_COMPONENTS,
             "glyph_ids": SSC_GLYPH_MAP,
             "constraint_ids": [
-                "-".join(combo.values())
+                _ssc_constraint_id(combo)
                 for combo in (*train_combinations, *val_combinations)
             ],
         },
         organisms=[{"organism_id": "visual-ssc-shared-codebook", "adapter_scope": "shared", "scoring": "constraint"}],
         source={"dataset": "procedural non-text glyphs", "license": "CC0-1.0 generated assets"},
-        ood_slices={"val": ["held_out_combination", "held_out_style", "held_out_position"]},
+        ood_slices={"val": ["held_out_combination", "held_out_style"]},
         private_metadata={"train_constraints": train_combinations, "val_constraints": val_combinations},
     )
     write_dataset(output_root, "visual_ssc", split_records, manifest)

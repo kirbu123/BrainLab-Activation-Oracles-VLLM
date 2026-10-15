@@ -182,3 +182,7 @@ def test_run_visual_taboo_1ton_launcher(tmp_path: Path):
     assert "logs/model_lora/Qwen3-VL-4B-Instruct-taboo-bird_1to2" in torchrun_args
     assert "data/val/target_organisms/registries_1toN/adapter_registry_1to2.json" in torchrun_args
     assert "--image-root" in torchrun_args
+    assert torchrun_args[torchrun_args.index("--save-steps") + 1] == "50"
+    assert torchrun_args[torchrun_args.index("--eval-steps") + 1] == "50"
+    assert torchrun_args[torchrun_args.index("--early-stopping-window") + 1] == "100"
+    assert torchrun_args[torchrun_args.index("--early-stopping-min-drop") + 1] == "0.05"
